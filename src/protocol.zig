@@ -22,12 +22,6 @@ pub const MsgType = enum(u8) {
     resize = 3,
     detach_req = 4,
     command = 5,
-    /// Marks this connection as a `boo ui` view. Sent right before the
-    /// attach so the daemon replays scrollback history on attach. A
-    /// daemon from before this message existed ignores the unknown type
-    /// and simply attaches the view with no history, so a new ui client
-    /// stays compatible with an already-running older daemon.
-    ui = 6,
     /// The background color of the client's real terminal, as a
     /// `RgbPayload`. The client probes its terminal once at startup and
     /// reports the answer so the daemon can satisfy OSC 11 background
@@ -43,11 +37,6 @@ pub const MsgType = enum(u8) {
     exit = 66,
     ok = 67,
     err = 68,
-    /// Which screen the application is on ("alt" or "primary"),
-    /// sent alongside every repaint. The passthrough strips screen
-    /// toggles, so clients cannot tell on their own; the ui uses it
-    /// to decide what a wheel over the viewport should do.
-    screen = 69,
     _,
 };
 

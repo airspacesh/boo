@@ -9,7 +9,6 @@ const daemonpkg = @import("daemon.zig");
 const help = @import("help.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
-const ui = @import("ui.zig");
 
 pub const version = "0.6.4";
 
@@ -65,7 +64,6 @@ pub fn main() !void {
 
     if (eql(cmd, "new")) return cmdNew(alloc, rest);
     if (eql(cmd, "attach") or eql(cmd, "at") or eql(cmd, "a")) return cmdAttach(alloc, rest);
-    if (eql(cmd, "ui") or eql(cmd, "i")) return cmdUi(alloc, rest);
     if (eql(cmd, "ls") or eql(cmd, "list")) return cmdLs(alloc, rest);
     if (eql(cmd, "send")) return cmdSend(alloc, rest);
     if (eql(cmd, "peek")) return cmdPeek(alloc, rest);
@@ -389,31 +387,6 @@ fn attachLoop(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void
             posix.exit(exit_runtime);
         },
     }
-}
-
-fn cmdUi(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
-    for (args) |arg| {
-        if (isHelpFlag(arg)) return printHelpPage("ui");
-        usageFail("ui", "unexpected argument '{s}'", .{arg});
-    }
-
-    const dir = try paths.socketDir(alloc);
-    defer alloc.free(dir);
-
-    // boo ui feeds session output through an in-process libghostty stream
-    // whose VT logs would otherwise paint over the viewport: std.log writes
-    // to stderr, which is the user's terminal here, while the daemon
-    // redirects its own stderr in runDaemon. Point stderr at BOO_LOG, or
-    // /dev/null, while the UI owns the screen, then restore it so the
-    // closing notice is visible.
-    const saved_stderr = redirectStderr();
-    const result = ui.run(alloc, dir);
-    restoreStderr(saved_stderr);
-    result catch |err| switch (err) {
-        error.NotATty => fail(exit_runtime, "ui requires a terminal", .{}),
-        else => return err,
-    };
-    std.debug.print("[boo ui closed]\n", .{});
 }
 
 fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -949,10 +922,10 @@ fn fmtIdle(buf: []u8, ms: i64) []const u8 {
 // -- Daemon plumbing ------------------------------------------------------
 
 /// Open the destination for std.log and std.debug output: $BOO_LOG
-/// (created, appended) when set, otherwise /dev/null. Both the session
-/// daemon and `boo ui` run with a terminal on stderr, where libghostty's
-/// in-process VT logging would paint over the display, so they route
-/// stderr here. Returns null when the target cannot be opened.
+/// (created, appended) when set, otherwise /dev/null. The session daemon
+/// is forked from a command whose stderr is the user's terminal, where
+/// libghostty's in-process VT logging would paint over the display, so
+/// it routes stderr here. Returns null when the target cannot be opened.
 fn openLogSink() ?posix.fd_t {
     if (posix.getenv("BOO_LOG")) |log_path| {
         return posix.open(log_path, .{
@@ -962,32 +935,6 @@ fn openLogSink() ?posix.fd_t {
         }, 0o600) catch null;
     }
     return posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch null;
-}
-
-/// Redirect stderr to the log sink for the lifetime of a foreground command
-/// that owns the terminal (boo ui). Returns a saved dup of the original
-/// stderr for restoreStderr, or -1 when stderr was left untouched.
-fn redirectStderr() posix.fd_t {
-    const sink = openLogSink() orelse return -1;
-    defer posix.close(sink);
-    // Mark the saved terminal stderr close-on-exec so it is not inherited
-    // by the session daemons boo ui spawns: createSession runs `boo new`,
-    // which forks the daemon, and a leaked dup would hold the pty open
-    // after the UI exits.
-    const saved = posix.dup(posix.STDERR_FILENO) catch return -1;
-    _ = posix.fcntl(saved, posix.F.SETFD, posix.FD_CLOEXEC) catch {};
-    posix.dup2(sink, posix.STDERR_FILENO) catch {
-        posix.close(saved);
-        return -1;
-    };
-    return saved;
-}
-
-/// Restore stderr from a redirectStderr handle. A no-op for -1.
-fn restoreStderr(saved: posix.fd_t) void {
-    if (saved < 0) return;
-    posix.dup2(saved, posix.STDERR_FILENO) catch {};
-    posix.close(saved);
 }
 
 fn runDaemon(
@@ -1115,16 +1062,13 @@ test "fmtIdle" {
 test {
     _ = @import("protocol.zig");
     _ = @import("paths.zig");
-    _ = @import("cwd.zig");
     _ = @import("keys.zig");
     _ = @import("pty.zig");
     _ = @import("reap.zig");
     _ = @import("altscreen.zig");
     _ = @import("oscquery.zig");
-    _ = @import("osc52.zig");
     _ = @import("window.zig");
     _ = @import("daemon.zig");
     _ = @import("client.zig");
     _ = @import("help.zig");
-    _ = @import("ui.zig");
 }

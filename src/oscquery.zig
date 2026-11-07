@@ -4,10 +4,9 @@
 //! Applications detect the terminal's light/dark theme by querying the
 //! background color with OSC 11 (`ESC ] 11 ; ? BEL`). Inside a boo
 //! session the real terminal is not reachable: a `boo attach` strips the
-//! query along with the alternate-screen tail it rides behind, and a
-//! `boo ui` view renders into a client-side terminal that never answers
-//! it. The daemon therefore answers these queries itself from the
-//! background a client reported (see `window.zig`).
+//! query along with the alternate-screen tail it rides behind. The
+//! daemon therefore answers these queries itself from the background a
+//! client reported (see `window.zig`).
 //!
 //! For that answer to be the only one, the query must not also reach the
 //! real terminal, or an attached client would see a duplicate reply land

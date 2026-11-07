@@ -56,10 +56,9 @@ const max_procs: usize = 16 * 1024;
 const grace_ms: i64 = 2000;
 const poll_slice_ms: u64 = 20;
 
-// Run the darwin layout asserts on every target (matching cwd.zig), so a
-// struct drift fails the build loudly rather than only on macOS. This
-// references a type, so it does not pull the libproc externs into a
-// non-macOS link.
+// Run the darwin layout asserts on every target, so a struct drift fails
+// the build loudly rather than only on macOS. This references a type, so
+// it does not pull the libproc externs into a non-macOS link.
 comptime {
     _ = darwin.proc_bsdinfo;
 }

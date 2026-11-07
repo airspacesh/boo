@@ -212,7 +212,7 @@ pub fn probeBackground(
 ) ?protocol.RgbPayload {
     leftover_len.* = 0;
     // The query goes to the terminal on stdout; the reply arrives on the
-    // input fd. For an attached client and the ui both are the same tty.
+    // input fd. For an attached client both are the same tty.
     protocol.writeAll(posix.STDOUT_FILENO, "\x1b]11;?\x07") catch return null;
 
     const deadline = std.time.milliTimestamp() + probe_timeout_ms;
@@ -298,8 +298,7 @@ fn parseChannel(s: []const u8) ?u16 {
     };
 }
 
-/// Configure a termios for raw byte-at-a-time input. Shared with the
-/// boo ui client, which manages its own terminal lifecycle.
+/// Configure a termios for raw byte-at-a-time input.
 pub fn rawMode(t: *posix.termios) void {
     t.iflag.IGNBRK = false;
     t.iflag.BRKINT = false;
@@ -429,8 +428,7 @@ const drain_kbd_enable = "\x1b[=11;1u";
 const drain_kbd_disable = "\x1b[=0;1u";
 
 /// Restore a raw client terminal: screen restore, input drain, then
-/// the mode switch. Shared with boo ui, whose quit has the same held
-/// command key and kitty release tail to absorb.
+/// the mode switch.
 pub fn restoreTty(
     tty: posix.fd_t,
     saved: posix.termios,
@@ -489,8 +487,8 @@ pub const ControlResult = struct {
 
 /// Send a single control command (-X) and wait for the reply. When
 /// `timeout_ms` is non-null, give up with `error.Timeout` if no reply
-/// arrives in that window, so a caller (notably `boo ui`) cannot hang
-/// forever on a daemon that has stopped answering.
+/// arrives in that window, so a caller cannot hang forever on a daemon
+/// that has stopped answering.
 pub fn control(
     alloc: std.mem.Allocator,
     socket_path: []const u8,
@@ -614,7 +612,7 @@ test "control times out when the daemon never answers" {
     // A listener that never accepts: connect() still succeeds via the
     // backlog and the command write is buffered, so the reply read is
     // what blocks. Without the timeout this call would hang forever
-    // (the boo ls / boo ui freeze); with it, it must give up.
+    // (the boo ls freeze); with it, it must give up.
     const lfd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
     defer {
         posix.close(lfd);

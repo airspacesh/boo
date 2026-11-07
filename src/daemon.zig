@@ -9,8 +9,7 @@
 //! Client sockets are non-blocking and per-connection output is queued
 //! and flushed on POLLOUT, so a client that reads slowly never blocks
 //! the loop. A blocking write here would stall the PTY and every other
-//! client until the slow reader caught up (the boo-ui freeze this
-//! design guards against).
+//! client until the slow reader caught up.
 
 const std = @import("std");
 const posix = std.posix;
@@ -19,7 +18,6 @@ const protocol = @import("protocol.zig");
 const keys = @import("keys.zig");
 const altscreen = @import("altscreen.zig");
 const paths = @import("paths.zig");
-const cwd = @import("cwd.zig");
 const reap = @import("reap.zig");
 const windowpkg = @import("window.zig");
 const Window = windowpkg.Window;
@@ -55,9 +53,6 @@ const Conn = struct {
     fd: posix.fd_t,
     decoder: protocol.Decoder,
     attached: bool = false,
-    /// A ui view (vs a plain attach): gets its scrollback history
-    /// replayed on attach so a wheel-up can page it.
-    ui: bool = false,
     /// The connection is finished: its fd is dead or it was dropped.
     /// `sweep` closes the fd and frees it.
     closed: bool = false,
@@ -156,13 +151,13 @@ pub const Daemon = struct {
     last_activity_ms: i64 = 0,
 
     /// Output arrived while no client was attached: the session has
-    /// activity you have not seen. The ui flags it; attaching clears it.
+    /// activity you have not seen. `ls` reports it; attaching clears it.
     unread: bool = false,
 
     /// Wall-clock time (milliseconds) of the last bell that rang while
     /// no client was attached, or 0 for none since you last looked. A
     /// bell is an explicit "your turn" request; the info reply reports
-    /// it as an age so the ui can combine it with output idle time.
+    /// it as an age so callers can combine it with output idle time.
     /// Attaching clears it.
     last_bell_ms: i64 = 0,
 
@@ -375,8 +370,6 @@ pub const Daemon = struct {
 
     fn handleMsg(self: *Daemon, conn: *Conn, msg: protocol.Msg) !void {
         switch (msg.type) {
-            .ui => conn.ui = true,
-
             .bg_color => {
                 // The client probed its real terminal's background and
                 // reported it; the window uses it to answer OSC 11
@@ -404,13 +397,6 @@ pub const Daemon = struct {
                 self.key_parser = .{};
                 self.resizeWindow(size.rows, size.cols);
                 self.updatePassthrough();
-                // A ui view starts with an empty terminal; seed its
-                // scrollback with the window's history (sized to the
-                // client) before the repaint puts the live screen at
-                // the bottom. conn.ui is set by the `.ui` marker the
-                // client sends just before attaching. Best effort:
-                // failure just means no history.
-                if (conn.ui) self.historyTo(conn) catch {};
                 try self.repaintTo(conn);
             },
 
@@ -542,7 +528,7 @@ pub const Daemon = struct {
                 0;
             // Age of the last bell that rang while you were away, or -1
             // for none. Reported against the same `now` as out_idle so
-            // the ui can compare the two.
+            // callers can compare the two.
             const bell_idle: i64 = if (self.last_bell_ms != 0)
                 @max(0, now - self.last_bell_ms)
             else
@@ -569,15 +555,6 @@ pub const Daemon = struct {
                 }
             }
             conn.send(.ok, out.items);
-        } else if (std.mem.eql(u8, cmd, "cwd")) {
-            // Report the session command's current working directory so
-            // a new session created from `boo ui` can be born there.
-            if (self.liveWindow()) |w| {
-                var buf: [std.fs.max_path_bytes]u8 = undefined;
-                if (cwd.ofPid(&buf, w.child_pid)) |dir| {
-                    conn.send(.ok, dir);
-                } else conn.send(.err, "working directory unavailable");
-            } else conn.send(.err, "no window");
         } else if (std.mem.eql(u8, cmd, "rename")) {
             if (argv.len != 2) {
                 conn.send(.err, "usage: rename <new-name>");
@@ -673,7 +650,7 @@ pub const Daemon = struct {
         win.last_output_ms = now;
         self.last_activity_ms = now;
         // Output produced while nothing is attached marks the session
-        // unread, so the ui can flag activity since you last looked.
+        // unread, so `ls` can flag activity since you last looked.
         // Attaching clears it.
         const detached = self.attachedConn() == null;
         if (detached) self.unread = true;
@@ -818,23 +795,6 @@ pub const Daemon = struct {
         }
     }
 
-    /// Send the window's scrollback history to a ui view as a stream of
-    /// `output` frames, to be fed before the repaint. The replay can be
-    /// larger than one frame, so it is split across messages; the client
-    /// feeds them in order into its terminal, so an escape sequence split
-    /// across the boundary still parses.
-    fn historyTo(self: *Daemon, conn: *Conn) !void {
-        const win = self.liveWindow() orelse return;
-        const bytes = (try win.historyReplay(self.alloc)) orelse return;
-        defer self.alloc.free(bytes);
-        var i: usize = 0;
-        while (i < bytes.len) {
-            const end = @min(i + protocol.max_payload, bytes.len);
-            conn.send(.output, bytes[i..end]);
-            i = end;
-        }
-    }
-
     fn repaintTo(self: *Daemon, conn: *Conn) !void {
         const win = self.liveWindow() orelse return;
         const bytes = try win.repaint(self.alloc);
@@ -843,10 +803,6 @@ pub const Daemon = struct {
         // from a clean slate.
         win.alt_filter.reset();
         conn.send(.output, bytes);
-        // Repaints accompany every screen identity change (attach,
-        // redraw, alt-screen switches), so this keeps the client's
-        // picture of the application's screen current.
-        conn.send(.screen, if (win.onAltScreen()) "alt" else "primary");
     }
 
     fn detachConn(self: *Daemon, conn: *Conn, reason: []const u8) void {

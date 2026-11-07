@@ -27,7 +27,6 @@ pub const overview =
     \\  Session Management
     \\    new [name] [-d] [-- cmd...]  start a session (attach unless -d)
     \\    attach, at, a <name>         attach a session (steals politely)
-    \\    ui, i                        manage sessions in a full-screen UI
     \\    ls [--json]                  list sessions
     \\
     \\  Interaction
@@ -54,7 +53,7 @@ pub const overview =
     \\environment:
     \\  BOO_DIR  socket directory
     \\           (default: /tmp/boo-<uid>)
-    \\  BOO_LOG  append daemon and 'boo ui' logs to this file (debugging)
+    \\  BOO_LOG  append daemon logs to this file (debugging)
     \\
 ;
 
@@ -110,69 +109,6 @@ pub const commands = [_]Entry{
         \\examples:
         \\  boo attach build     reattach "build"
         \\  boo at bu            the same, by prefix
-        \\
-        ,
-    },
-    .{
-        .name = "ui",
-        .alias = "i",
-        .body =
-        \\usage: boo ui
-        \\       boo i
-        \\
-        \\Manage sessions in a full-screen interface: a sidebar lists
-        \\every session (window title underneath) and the focused
-        \\session runs in a viewport on the right, rendered live from
-        \\terminal state.
-        \\
-        \\sidebar markers (left of the name):
-        \\  ●  your turn: a bell rang while you were away (e.g. an agent
-        \\     finished its turn). Bold blue. Clears when you focus it.
-        \\  •  unread output you have not viewed, dim. Clears when you
-        \\     focus the session.
-        \\  *  attached by another client
-        \\
-        \\mouse:
-        \\  click a session     focus it (steals politely, like attach)
-        \\  click its 'x'       kill it (asks for confirmation)
-        \\  scroll the sidebar  scroll the session list
-        \\  wheel in viewport   scroll the session's history; wheel
-        \\                      back down or press esc to return to
-        \\                      live output (full-screen applications
-        \\                      receive arrow keys instead)
-        \\  in the viewport     forwarded to the application when it
-        \\                      asked for mouse reporting; otherwise
-        \\                      dragging selects text and copies it on
-        \\                      release (OSC 52)
-        \\
-        \\keys (prefix C-a, control variants match GNU screen):
-        \\  C-a c   create a session and focus it; it starts in the
-        \\          focused session's working directory
-        \\  C-a k   kill the focused session (asks y/n)
-        \\  C-a r   rename the focused session
-        \\  C-a g   go to a session by name (best match)
-        \\  C-a n   focus the next session
-        \\  C-a p   focus the previous session
-        \\  C-a Up, C-a Down
-        \\          browse the session list without attaching:
-        \\          Up/Down move the selection, Enter attaches it,
-        \\          Esc returns to the focused session
-        \\  C-a Left, C-a Right
-        \\          resize the sidebar: Left/Right adjust the width,
-        \\          Enter keeps it, Esc restores the previous width
-        \\  C-a s   show or hide the sidebar; the viewport takes the
-        \\          full width while it is hidden
-        \\  C-a C-a focus the previously focused session
-        \\  C-a d   quit the UI (sessions keep running)
-        \\  C-a l   redraw
-        \\  C-a a   send a literal C-a to the application
-        \\  C-a Esc cancel the armed prefix
-        \\
-        \\Pressing C-a alone lists these bindings in the bottom bar.
-        \\
-        \\Everything else is typed into the focused session. Unlike a
-        \\plain attach, pasted text may contain C-a bytes safely
-        \\(bracketed paste).
         \\
         ,
     },
@@ -333,9 +269,6 @@ pub const topics = [_]Entry{
         \\Control variants match GNU screen: C-a C-d detaches and
         \\C-a C-l redraws. Detaching leaves the session running;
         \\'boo attach' brings it back.
-        \\
-        \\'boo ui' adds bindings for managing sessions; see
-        \\'boo help ui'.
         \\
         ,
     },

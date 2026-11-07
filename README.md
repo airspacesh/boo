@@ -32,7 +32,6 @@ exactly as a human would see it.
 ## Features
 
 - Sessions that survive disconnects: detach with `Ctrl-A d`, reattach with `boo attach`.
-- A full-screen session manager: `boo ui` lists sessions in a sidebar.
 - Faithful redraws from libghostty terminal state, including SGR styles, cursor position, scrolling regions, window title, and terminal modes.
 - Agent-friendly automation primitives: `send`, `peek`, `wait`, and `--json` output, all usable without a TTY.
 
@@ -56,7 +55,6 @@ install location (default: `/usr/local/bin` when writable, otherwise
 boo new                    # new session running $SHELL, attached
 boo new work               # named session
 boo new work -d -- make    # create detached, running a command
-boo ui                     # manage sessions in a full-screen UI (alias: i)
 boo ls                     # list sessions
 boo attach work            # reattach (alias: at, a)
 boo rename work api        # rename a session
@@ -80,8 +78,6 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 | `C-a d`, `C-a C-d` | detach                     |
 | `C-a l`, `C-a C-l` | redraw                     |
 | `C-a a`   | send a literal `C-a`                |
-
-`boo ui` adds additional keybinds for switching, resizing and hiding the sidebar, creating sessions, and killing them.
 
 ### Automation
 
@@ -132,7 +128,7 @@ sleep loops.
 
 tmux is great, it just solves a different problem. boo keeps screen's
 model by design: sessions, a prefix key, and nothing else to learn.
-One session per task, with `boo ui` to juggle them.
+One session per task.
 
 ## Contributing
 
@@ -176,10 +172,9 @@ This is a young project, not a drop-in GNU screen replacement:
 
 - One attached client per session (attaching steals); no `-x` sharing.
 - One window per session: no splits or tabs inside a session. Run one
-  session per task and juggle them with `boo ui`.
+  session per task.
 - The `C-a` prefix is not yet configurable, and pasted bytes containing
-  `0x01` are interpreted as the prefix (GNU screen has the same quirk;
-  `boo ui` is immune thanks to bracketed paste).
+  `0x01` are interpreted as the prefix (GNU screen has the same quirk).
 - Sessions run with `TERM=xterm-256color`.
 
 ## Support
