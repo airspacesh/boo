@@ -13,6 +13,10 @@ const protocol = @import("protocol.zig");
 
 const log = std.log.scoped(.window);
 
+/// Ghostty's own default scrollback-limit. The terminal allocates
+/// history pages as output fills them, so a quiet session stays small.
+const max_scrollback_bytes = 10_000_000;
+
 pub const Window = struct {
     alloc: std.mem.Allocator,
 
@@ -105,7 +109,7 @@ pub const Window = struct {
         self.term = try vt.Terminal.init(alloc, .{
             .cols = cols,
             .rows = rows,
-            .max_scrollback = 512 * 1024,
+            .max_scrollback = max_scrollback_bytes,
         });
         errdefer self.term.deinit(alloc);
 
