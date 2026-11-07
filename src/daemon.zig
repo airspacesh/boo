@@ -604,9 +604,12 @@ pub const Daemon = struct {
         }
     }
 
-    /// Move the session to a new name by renaming the listening
-    /// socket; established connections survive, and new clients find
-    /// the session under the new name.
+    /// Move the session to a new name by listening on a socket under
+    /// the new name and retiring the old one. Established connections
+    /// survive, and new clients find the session under the new name.
+    /// bind refuses a name that a live session holds. A fresh bind also
+    /// keeps /proc/net/unix naming the socket's real path, which
+    /// systemd-tmpfiles checks before it ages a socket out of /tmp.
     fn rename(self: *Daemon, conn: *Conn, new_name: []const u8) void {
         paths.validateName(new_name) catch {
             conn.send(.err, "invalid session name");
@@ -628,22 +631,17 @@ pub const Daemon = struct {
             return;
         };
 
-        // Refuse to clobber another session's socket. Checking first
-        // is racy, but the window is tiny and losing the race only
-        // replaces a socket the same way 'kill' would free it.
-        if (std.fs.cwd().access(new_path, .{})) |_| {
+        const listen_fd = main.bindListen(self.alloc, new_path) catch |err| {
             self.alloc.free(new_path);
             self.alloc.free(new_owned_name);
-            conn.send(.err, "a session with that name already exists");
-            return;
-        } else |_| {}
-
-        std.fs.cwd().rename(self.opts.socket_path, new_path) catch {
-            self.alloc.free(new_path);
-            self.alloc.free(new_owned_name);
-            conn.send(.err, "rename failed");
+            conn.send(.err, switch (err) {
+                error.SessionExists => "a session with that name already exists",
+                else => "rename failed",
+            });
             return;
         };
+        self.retireListener();
+        self.opts.listen_fd = listen_fd;
 
         if (self.owned_name) |n| self.alloc.free(n);
         if (self.owned_socket_path) |p| self.alloc.free(p);

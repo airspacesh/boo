@@ -1042,7 +1042,7 @@ fn runDaemon(
     posix.exit(0);
 }
 
-fn bindListen(alloc: std.mem.Allocator, sock_path: []const u8) !posix.fd_t {
+pub fn bindListen(alloc: std.mem.Allocator, sock_path: []const u8) !posix.fd_t {
     const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
     errdefer posix.close(fd);
 
