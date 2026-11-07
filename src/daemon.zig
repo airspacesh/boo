@@ -547,15 +547,18 @@ pub const Daemon = struct {
                 @max(0, now - self.last_bell_ms)
             else
                 -1;
+            // The session command's pid, or -1 once it has exited.
+            const pid: posix.pid_t = if (self.liveWindow()) |w| w.child_pid else -1;
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.alloc);
-            try out.print(self.alloc, "{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t", .{
+            try out.print(self.alloc, "{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t", .{
                 self.opts.name,
                 if (attached) "Attached" else "Detached",
                 idle,
                 out_idle,
                 @intFromBool(self.unread),
                 bell_idle,
+                pid,
             });
             // Window title last; sanitized, so it cannot contain the
             // tabs that separate the fields.

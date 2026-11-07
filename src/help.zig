@@ -189,9 +189,10 @@ pub const commands = [_]Entry{
         \\flags:
         \\  --json  emit a JSON array:
         \\          [{"name","attached","idle_ms","unread",
-        \\            "bell_idle_ms","title"}]
+        \\            "bell_idle_ms","pid","title"}]
         \\          ("unread" flags unseen output; "bell_idle_ms" is the
-        \\           age of a bell rung while away, -1 if none)
+        \\           age of a bell rung while away, -1 if none; "pid" is
+        \\           the session command's pid, -1 once it has exited)
         \\
         ,
     },
@@ -369,7 +370,7 @@ pub const topics = [_]Entry{
         \\
         \\machine-readable output:
         \\  boo ls --json    [{"name","attached","idle_ms","unread",
-        \\                    "bell_idle_ms","title"}]
+        \\                    "bell_idle_ms","pid","title"}]
         \\  boo peek --json  {"session","title","rows","cols",
         \\                    "cursor":{"row","col"},"screen"}
         \\

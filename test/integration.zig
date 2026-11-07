@@ -1141,6 +1141,9 @@ test "ls emits machine-readable JSON" {
         try std.testing.expectEqual(false, obj.get("unread").?.bool);
         // No bell has rung, so there is no "your turn".
         try std.testing.expectEqual(@as(i64, -1), obj.get("bell_idle_ms").?.integer);
+        // The pid names the running cat.
+        const pid: std.posix.pid_t = @intCast(obj.get("pid").?.integer);
+        try std.posix.kill(pid, 0);
     }
 }
 
