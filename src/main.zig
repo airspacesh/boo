@@ -1063,6 +1063,7 @@ test {
     _ = @import("protocol.zig");
     _ = @import("paths.zig");
     _ = @import("keys.zig");
+    _ = @import("copymode.zig");
     _ = @import("pty.zig");
     _ = @import("reap.zig");
     _ = @import("altscreen.zig");

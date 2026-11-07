@@ -77,7 +77,13 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 |-----------|-------------------------------------|
 | `C-a d`, `C-a C-d` | detach                     |
 | `C-a l`, `C-a C-l` | redraw                     |
+| `C-a [`, `C-a Esc` | scroll the history (copy mode) |
 | `C-a a`   | send a literal `C-a`                |
+
+In copy mode, `k`/`j` or the arrow keys move a row, `C-u`/`C-d` half a
+page, `C-b`/`C-f` or PgUp/PgDn a page, and `g`/`G` or Home/End jump to
+the top or bottom of the history. `q` or `Esc` returns to the live
+screen.
 
 ### Automation
 

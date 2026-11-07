@@ -16,6 +16,7 @@ const posix = std.posix;
 
 const protocol = @import("protocol.zig");
 const keys = @import("keys.zig");
+const copymode = @import("copymode.zig");
 const altscreen = @import("altscreen.zig");
 const paths = @import("paths.zig");
 const reap = @import("reap.zig");
@@ -53,6 +54,9 @@ const Conn = struct {
     fd: posix.fd_t,
     decoder: protocol.Decoder,
     attached: bool = false,
+    /// The attached client is in copy mode. Output stops passing through
+    /// to it, and its keys scroll a view of the window's history.
+    copy_mode: bool = false,
     /// The connection is finished: its fd is dead or it was dropped.
     /// `sweep` closes the fd and frees it.
     closed: bool = false,
@@ -413,7 +417,8 @@ pub const Daemon = struct {
                 // When the window runs the kitty keyboard protocol
                 // or modifyOtherKeys, the client's terminal mirrors
                 // it and sends the prefix key encoded.
-                const prot: keys.Protocols = if (self.liveWindow()) |w| .{
+                // A copy mode frame resets the client's keyboard modes.
+                const prot: keys.Protocols = if (conn.copy_mode) .{} else if (self.liveWindow()) |w| .{
                     .kitty = w.kittyKeysActive(),
                     .modify = w.modifyKeysActive(),
                 } else .{};
@@ -424,6 +429,7 @@ pub const Daemon = struct {
                 if (!conn.attached) return;
                 const size = try protocol.SizePayload.decode(msg.payload);
                 self.resizeWindow(size.rows, size.cols);
+                if (conn.copy_mode) try self.copyFrameTo(conn);
             },
 
             .detach_req => {
@@ -445,7 +451,9 @@ pub const Daemon = struct {
         // would EOF or garble the program the user just left.
         if (!conn.attached) return;
         switch (cmd) {
-            .forward => |bytes| if (self.liveWindow()) |w| {
+            .forward => |bytes| if (conn.copy_mode) {
+                try self.copyModeInput(conn, bytes);
+            } else if (self.liveWindow()) |w| {
                 w.writeInput(bytes) catch {};
             },
             .detach => |byte| self.detachConn(
@@ -454,7 +462,8 @@ pub const Daemon = struct {
                 // user may be holding the byte that EOFs shells.
                 if (byte == 0x04) "detached-eof" else "detached",
             ),
-            .redraw => try self.repaintTo(conn),
+            .redraw => if (conn.copy_mode) try self.copyFrameTo(conn) else try self.repaintTo(conn),
+            .copy_mode => try self.enterCopyMode(conn),
             .unknown => |byte| if (std.ascii.isPrint(byte))
                 self.message(conn, "unknown key: ^A {c}", .{byte})
             else
@@ -673,6 +682,13 @@ pub const Daemon = struct {
             // Not passed through: the window answers queries itself.
             win.feed(cleaned);
             self.noteBell(win, detached, now);
+            // Copy mode at the bottom of the history follows the output.
+            // Scrolled up, its viewport stays pinned to the rows it shows.
+            const viewer = self.attachedConn() orelse return;
+            if (!viewer.copy_mode or !win.term.screens.active.viewportIsBottom()) return;
+            self.copyFrameTo(viewer) catch |err| {
+                log.warn("copy mode frame after output failed: {}", .{err});
+            };
             return;
         };
 
@@ -780,8 +796,8 @@ pub const Daemon = struct {
     }
 
     fn updatePassthrough(self: *Daemon) void {
-        const attached = self.attachedConn() != null;
-        if (self.liveWindow()) |w| w.passthrough = attached;
+        const passing = if (self.attachedConn()) |conn| !conn.copy_mode else false;
+        if (self.liveWindow()) |w| w.passthrough = passing;
     }
 
     fn resizeWindow(self: *Daemon, rows: u16, cols: u16) void {
@@ -793,6 +809,44 @@ pub const Daemon = struct {
                 log.warn("resize window failed: {}", .{err});
             };
         }
+    }
+
+    /// Start copy mode at the bottom of the history. The window stops
+    /// passing output through, so it answers terminal queries itself.
+    fn enterCopyMode(self: *Daemon, conn: *Conn) !void {
+        const win = self.liveWindow() orelse return;
+        win.term.scrollViewport(.bottom);
+        conn.copy_mode = true;
+        self.updatePassthrough();
+        try self.copyFrameTo(conn);
+    }
+
+    fn leaveCopyMode(self: *Daemon, conn: *Conn) !void {
+        const win = self.liveWindow() orelse return;
+        win.term.scrollViewport(.bottom);
+        conn.copy_mode = false;
+        self.updatePassthrough();
+        try self.repaintTo(conn);
+    }
+
+    fn copyModeInput(self: *Daemon, conn: *Conn, input: []const u8) !void {
+        const win = self.liveWindow() orelse return;
+        var rest = input;
+        while (rest.len > 0) {
+            const key = copymode.decodeKey(rest);
+            rest = rest[key.len..];
+            const action = key.action orelse continue;
+            if (action == .exit) return self.leaveCopyMode(conn);
+            win.term.scrollViewport(copymode.viewportScroll(action, win.term.rows));
+        }
+        try self.copyFrameTo(conn);
+    }
+
+    fn copyFrameTo(self: *Daemon, conn: *Conn) !void {
+        const win = self.liveWindow() orelse return;
+        const bytes = try win.copyModeFrame(self.alloc);
+        defer self.alloc.free(bytes);
+        conn.send(.output, bytes);
     }
 
     fn repaintTo(self: *Daemon, conn: *Conn) !void {

@@ -39,6 +39,7 @@ pub const Command = union(enum) {
     /// the detach as EOF-dangerous for the client's input drain.
     detach: u8,
     redraw,
+    copy_mode,
     unknown: u8,
 };
 
@@ -198,7 +199,9 @@ pub const Parser = struct {
             if (ctrl_only and cp >= 'a' and cp <= 'z') {
                 return dispatch(@intCast(cp & 0x1f), handler);
             }
-            if (plain and cp >= 0x20 and cp <= 0x7f) {
+            // Kitty reports Esc as codepoint 27, below the printable
+            // range.
+            if (plain and (cp == 0x1b or (cp >= 0x20 and cp <= 0x7f))) {
                 return dispatch(@intCast(cp), handler);
             }
             return handler.command(.{
@@ -275,6 +278,7 @@ pub const Parser = struct {
         switch (byte) {
             'd', 0x04 => try handler.command(.{ .detach = byte }),
             'l', 0x0c => try handler.command(.redraw),
+            0x1b, '[' => try handler.command(.copy_mode),
             'a' => try handler.command(.{ .forward = &.{escape_byte} }),
             else => try handler.command(.{ .unknown = byte }),
         }
@@ -436,6 +440,18 @@ test "prefix split across feeds" {
     try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
 }
 
+test "C-a Esc and C-a [ enter copy mode" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{};
+    try p.feed("\x01\x1b", .{}, &h);
+    try p.feed("\x01[", .{}, &h);
+    try std.testing.expectEqual(@as(usize, 2), h.cmds.items.len);
+    try std.testing.expectEqual(Command.copy_mode, h.cmds.items[0]);
+    try std.testing.expectEqual(Command.copy_mode, h.cmds.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
 test "control variants match screen defaults" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
@@ -474,6 +490,16 @@ test "kitty: encoded Ctrl+A starts the prefix, plain d detaches" {
     try p.feed("\x1b[97;5ud", .{ .kitty = true }, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
     try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "kitty: encoded Ctrl+A then encoded Esc enters copy mode" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{};
+    try p.feed("\x1b[97;5u\x1b[27u", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
+    try std.testing.expectEqual(Command.copy_mode, h.cmds.items[0]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 

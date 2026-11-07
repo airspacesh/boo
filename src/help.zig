@@ -264,11 +264,27 @@ pub const topics = [_]Entry{
         \\
         \\  C-a d   detach
         \\  C-a l   redraw
+        \\  C-a [   scroll the session's history (copy mode), also C-a Esc
         \\  C-a a   send a literal C-a
         \\
         \\Control variants match GNU screen: C-a C-d detaches and
         \\C-a C-l redraws. Detaching leaves the session running;
         \\'boo attach' brings it back.
+        \\
+        \\Copy mode keys
+        \\
+        \\  k, Up        up a row
+        \\  j, Down      down a row
+        \\  C-u, C-d     up or down half a page
+        \\  C-b, PgUp    up a page
+        \\  C-f, PgDn    down a page
+        \\  g, Home      top of the history
+        \\  G, End       bottom of the history
+        \\  q, Esc       back to the live screen
+        \\
+        \\The tag at the top right shows how many rows you have scrolled
+        \\back, out of the rows of history. Output keeps reaching the
+        \\session while you scroll.
         \\
         ,
     },

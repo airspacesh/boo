@@ -309,9 +309,10 @@ pub const Window = struct {
         return self.term.screens.active_key == .alternate;
     }
 
-    /// Plain-text dump of the screen, for peek.
+    /// Plain-text dump of the live screen for peek. It reads the active
+    /// area, not the viewport that copy mode scrolls into the history.
     pub fn plainScreen(self: *Window, alloc: std.mem.Allocator) ![]const u8 {
-        return self.term.plainString(alloc);
+        return self.term.screens.active.dumpStringAlloc(alloc, .{ .active = .{} });
     }
 
     /// Plain-text dump including the full scrollback history.
@@ -334,7 +335,7 @@ pub const Window = struct {
         // content lands shifted up by the trimmed count and the cursor
         // restore below points at the wrong row; every relative redraw
         // the application makes after that corrupts the client's view.
-        formatter.content = .{ .selection = self.screenSelection() };
+        formatter.content = .{ .selection = self.areaSelection(.active) };
         formatter.extra = .{
             // Keep the client's own palette: colors are emitted as
             // palette references, not redefined.
@@ -368,17 +369,48 @@ pub const Window = struct {
         return alloc.dupe(u8, out.writer.buffered());
     }
 
-    /// Selection spanning the visible screen of the active terminal
-    /// screen, so a repaint excludes scrollback history. Null (the
-    /// formatter's dump-everything default) only if the pins cannot
+    /// VT bytes that show copy mode's viewport on a freshly sanitized
+    /// terminal, with the cursor hidden. A tag at the top right shows how
+    /// many rows the viewport is scrolled back, out of the rows of
+    /// history.
+    pub fn copyModeFrame(self: *Window, alloc: std.mem.Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll(sanitize_sequence ++ "\x1b[?25l");
+
+        var formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
+        formatter.content = .{ .selection = self.areaSelection(.viewport) };
+        formatter.extra = .none;
+        try out.writer.print("{f}", .{formatter});
+
+        const bar = self.term.screens.active.pages.scrollbar();
+        const history_rows = bar.total - bar.len;
+        var tag_buf: [48]u8 = undefined;
+        const tag = try std.fmt.bufPrint(&tag_buf, "[{d}/{d}]", .{
+            history_rows - bar.offset,
+            history_rows,
+        });
+        const tag_col = self.term.cols -| tag.len + 1;
+        try out.writer.print("\x1b[0m\x1b[1;{d}H\x1b[7m{s}\x1b[0m", .{ tag_col, tag });
+
+        return alloc.dupe(u8, out.writer.buffered());
+    }
+
+    /// Selection spanning the rows of `area` on the active terminal
+    /// screen. `.active` is the live screen without the history above
+    /// it, and `.viewport` is the rows copy mode has scrolled to. Null
+    /// (the formatter's dump-everything default) only if the pins cannot
     /// resolve, which a sized terminal never produces.
-    fn screenSelection(self: *Window) ?vt.Selection {
+    fn areaSelection(self: *Window, comptime area: vt.point.Tag) ?vt.Selection {
         const pages = &self.term.screens.active.pages;
-        const tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } }) orelse return null;
-        const br = pages.pin(.{ .active = .{
+        const tl = pages.pin(@unionInit(vt.Point, @tagName(area), .{
+            .x = 0,
+            .y = 0,
+        })) orelse return null;
+        const br = pages.pin(@unionInit(vt.Point, @tagName(area), .{
             .x = self.term.cols - 1,
             .y = self.term.rows - 1,
-        } }) orelse return null;
+        })) orelse return null;
         return vt.Selection.init(tl, br, false);
     }
 

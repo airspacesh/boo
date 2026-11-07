@@ -1604,3 +1604,72 @@ test "plain attach replays the visible screen only, never scrollback history" {
     try client.waitFor("detached from plain");
     _ = try client.waitExit();
 }
+
+/// Render a copy mode frame and return its first row, which ends in the
+/// viewport's place in the history. The tag closes the frame, so its
+/// trailing SGR reset marks the frame as complete.
+fn waitCopyFrame(alloc: std.mem.Allocator, client: *PtyClient, rows: u16, cols: u16) ![]const u8 {
+    try client.waitFor("]\x1b[0m");
+    return renderScreen(alloc, client.output.items, rows, cols);
+}
+
+test "copy mode scrolls the history and returns to the live screen" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("copy", &.{"sh"});
+    try h.sendLine("copy", "i=1; while [ $i -le 60 ]; do printf 'HIST-%03d\\n' $i; i=$((i+1)); done");
+    const seeded = try h.waitPeekContains("copy", "HIST-060");
+    alloc.free(seeded);
+
+    var client = try PtyClient.spawn(&h, &.{ "attach", "copy" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("HIST-060");
+
+    // Entering copy mode shows the live screen, scrolled back 0 rows.
+    client.clearOutput();
+    try client.send("\x01[");
+    {
+        const screen = try waitCopyFrame(alloc, &client, 24, 80);
+        defer alloc.free(screen);
+        try std.testing.expect(std.mem.indexOf(u8, screen, "HIST-060") != null);
+        try std.testing.expect(std.mem.indexOf(u8, screen, "[0/") != null);
+    }
+
+    // g goes to the top of the history, where the first lines are.
+    client.clearOutput();
+    try client.send("g");
+    {
+        const screen = try waitCopyFrame(alloc, &client, 24, 80);
+        defer alloc.free(screen);
+        try std.testing.expect(std.mem.indexOf(u8, screen, "HIST-001") != null);
+        try std.testing.expect(std.mem.indexOf(u8, screen, "HIST-060") == null);
+        // At the top, the rows scrolled back equal the rows of history.
+        const first_row = screen[0 .. std.mem.indexOfScalar(u8, screen, '\n') orelse screen.len];
+        const open = std.mem.lastIndexOfScalar(u8, first_row, '[').?;
+        const slash = std.mem.indexOfScalarPos(u8, first_row, open, '/').?;
+        const close = std.mem.indexOfScalarPos(u8, first_row, slash, ']').?;
+        try std.testing.expectEqualStrings(first_row[open + 1 .. slash], first_row[slash + 1 .. close]);
+    }
+
+    // Output while scrolled back stays out of the frame.
+    client.clearOutput();
+    try h.sendLine("copy", "echo LIVE-MARK");
+    const live = try h.waitPeekContains("copy", "LIVE-MARK\n");
+    alloc.free(live);
+    while (try client.pump(200)) {}
+    try std.testing.expect(std.mem.indexOf(u8, client.output.items, "LIVE-MARK") == null);
+
+    // q returns to the live screen, which has kept up, and typing reaches
+    // the shell again.
+    try client.send("q");
+    try client.waitFor("LIVE-MARK");
+    try client.send("echo AFTER-COPY\r");
+    const after = try h.waitPeekContains("copy", "AFTER-COPY\n");
+    alloc.free(after);
+
+    try client.send("\x01d");
+    try client.waitFor("detached from copy");
+    _ = try client.waitExit();
+}
