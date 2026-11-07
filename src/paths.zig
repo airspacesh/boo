@@ -67,11 +67,17 @@ fn socketDirFrom(
     return dir;
 }
 
+/// Dir.makePath checks an existing directory with statx, which Linux added
+/// in 4.11, so on older kernels every command after the first would fail.
+/// Open the directory first and only make it when it is missing.
 fn ensureDir(dir: []const u8) !void {
-    std.fs.cwd().makePath(dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
+    if (std.fs.cwd().openDir(dir, .{})) |d| {
+        var existing = d;
+        existing.close();
+    } else |err| switch (err) {
+        error.FileNotFound => try std.fs.cwd().makePath(dir),
         else => return err,
-    };
+    }
     // Best effort: sockets must not be reachable by other users.
     std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o700, 0) catch {};
 }
