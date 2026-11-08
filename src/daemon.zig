@@ -455,7 +455,10 @@ pub const Daemon = struct {
                 if (!conn.attached) return;
                 const size = try protocol.SizePayload.decode(msg.payload);
                 self.resizeWindow(size.rows, size.cols);
-                if (conn.copy_mode) conn.view = .stale;
+                // The client's terminal and the window each fit the old
+                // screen to the new size in their own way, so the canvas
+                // is repainted to match the window.
+                conn.view = .stale;
             },
 
             .detach_req => {

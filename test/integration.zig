@@ -650,6 +650,54 @@ test "window size: initial attach size and SIGWINCH resize reach the app" {
     }
 }
 
+test "after a resize the client shows the screen as the session reflowed it" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Lines of 70 columns, which the session's primary screen rewraps
+    // when it narrows to 40, and the client's alternate-screen canvas
+    // cuts off.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (0..8) |i| try text.print(alloc, "L{d}{s}\r\n", .{ i, "x" ** 68 });
+    try startDetachedWriting(&h, "narrow", 24, 80, text.items);
+    const peeked = try h.waitPeekContains("narrow", "L7");
+    alloc.free(peeked);
+
+    var client = try PtyClient.spawn(&h, &.{ "attach", "narrow" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("L7");
+    try pumpQuiet(&client);
+    const resized_at = client.output.items.len;
+    try client.setSize(24, 40);
+    try pumpQuiet(&client);
+
+    // Render what the client was sent on a terminal resized at the same
+    // point, standing in for the user's.
+    var term = try vt.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(client.output.items[0..resized_at]);
+    try term.resize(alloc, 40, 24);
+    stream.nextSlice(client.output.items[resized_at..]);
+    const screen = try term.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(screen);
+
+    const now = try h.run(&.{ "peek", "narrow" });
+    defer alloc.free(now.stdout);
+    defer alloc.free(now.stderr);
+    try std.testing.expectEqualStrings(
+        std.mem.trimRight(u8, now.stdout, "\n"),
+        std.mem.trimRight(u8, screen, "\n"),
+    );
+
+    try client.send("\x01d");
+    try client.waitFor("detached from narrow");
+    _ = try client.waitExit();
+}
+
 test "new --rows/--cols births the session at that size" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
