@@ -38,16 +38,28 @@ pub const Options = struct {
     cwd: ?[]const u8 = null,
 };
 
-/// Hard cap on a single connection's queued-but-unsent output. The
-/// daemon never blocks on a client write (see `Conn.flush`), so a
-/// client that stops reading would otherwise grow this without bound.
-/// A client that falls this far behind is dropped instead; it
-/// reconnects and gets a fresh repaint. Generous, so an ordinary burst
-/// (a full-screen repaint is kilobytes) never trips it.
+/// How much queued-but-unsent output a connection may hold. The daemon
+/// never blocks on a client write (see `Conn.flush`), so a client that
+/// stops reading would otherwise grow its queue without bound. An
+/// attached client this far behind stops receiving output until it has
+/// read the queue, and then gets a fresh frame (see `View`). Any other
+/// connection is dropped. Generous, so an ordinary burst never trips it.
 const max_conn_out: usize = 8 * 1024 * 1024;
 
 /// Upper bound on how long teardown waits for queued finals to drain.
 const shutdown_drain_ms: i64 = 250;
+
+/// How an attached client's canvas relates to the window.
+const View = enum {
+    /// The canvas shows the window as it is. In passthrough, output
+    /// keeps it that way.
+    current,
+    /// The canvas needs a fresh frame, which goes out once the client has
+    /// read everything queued. Output is withheld until then, so a client
+    /// that reads slowly gets one frame of the latest state instead of a
+    /// backlog it would only see the end of.
+    stale,
+};
 
 const Conn = struct {
     alloc: std.mem.Allocator,
@@ -57,6 +69,7 @@ const Conn = struct {
     /// The attached client is in copy mode. Output stops passing through
     /// to it, and its keys scroll a view of the window's history.
     copy_mode: bool = false,
+    view: View = .current,
     /// The connection is finished: its fd is dead or it was dropped.
     /// `sweep` closes the fd and frees it.
     closed: bool = false,
@@ -67,23 +80,29 @@ const Conn = struct {
     /// The socket is non-blocking, so a slow reader backs up here
     /// instead of blocking the loop. Drained on POLLOUT.
     out: std.ArrayList(u8) = .empty,
-    /// Drop threshold for `out`; a field so tests can shrink it.
+    /// Limit on `out` (see `max_conn_out`); a field so tests can shrink
+    /// it.
     out_cap: usize = max_conn_out,
+
+    /// Whether `out` has grown past `out_cap`.
+    fn behind(self: *const Conn) bool {
+        return self.out.items.len > self.out_cap;
+    }
 
     /// Queue a frame and write what the socket will take right now.
     /// Never blocks: the unsent remainder waits for the next POLLOUT. A
-    /// client that backs up past `out_cap` is dropped rather than
-    /// buffered without bound.
+    /// connection already `behind` is dropped rather than buffered
+    /// without bound.
     fn send(self: *Conn, msg_type: protocol.MsgType, payload: []const u8) void {
         if (self.closed or self.shutdown) return;
+        if (self.behind()) {
+            self.drop();
+            return;
+        }
         protocol.appendMsg(self.alloc, &self.out, msg_type, payload) catch {
             self.drop();
             return;
         };
-        if (self.out.items.len > self.out_cap) {
-            self.drop();
-            return;
-        }
         self.flush();
     }
 
@@ -305,6 +324,9 @@ pub const Daemon = struct {
             }
             if (self.heldKeyTimeoutMs() == 0) self.resolveHeldKey();
 
+            // Frames go out once per pass, so everything that invalidated
+            // the view in this pass costs one frame.
+            if (self.attachedConn()) |c| self.sendFrame(c);
             self.sweep();
             if (self.liveWindow() == null) {
                 self.broadcastExit("command exited");
@@ -406,7 +428,7 @@ pub const Daemon = struct {
                 self.key_parser = .{};
                 self.resizeWindow(size.rows, size.cols);
                 self.updatePassthrough();
-                try self.repaintTo(conn);
+                conn.view = .stale;
             },
 
             .input => {
@@ -428,7 +450,7 @@ pub const Daemon = struct {
                 if (!conn.attached) return;
                 const size = try protocol.SizePayload.decode(msg.payload);
                 self.resizeWindow(size.rows, size.cols);
-                if (conn.copy_mode) try self.copyFrameTo(conn);
+                if (conn.copy_mode) conn.view = .stale;
             },
 
             .detach_req => {
@@ -451,7 +473,7 @@ pub const Daemon = struct {
         if (!conn.attached) return;
         switch (cmd) {
             .forward => |bytes| {
-                const window_bytes = if (conn.copy_mode) try self.copyModeInput(conn, bytes) else bytes;
+                const window_bytes = if (conn.copy_mode) self.copyModeInput(conn, bytes) else bytes;
                 if (self.liveWindow()) |w| w.writeInput(window_bytes) catch {};
             },
             .detach => |byte| self.detachConn(
@@ -460,8 +482,8 @@ pub const Daemon = struct {
                 // user may be holding the byte that EOFs shells.
                 if (byte == 0x04) "detached-eof" else "detached",
             ),
-            .redraw => if (conn.copy_mode) try self.copyFrameTo(conn) else try self.repaintTo(conn),
-            .copy_mode => try self.enterCopyMode(conn),
+            .redraw => conn.view = .stale,
+            .copy_mode => self.enterCopyMode(conn),
             .unknown => |byte| if (std.ascii.isPrint(byte))
                 self.message(conn, "unknown key: ^A {c}", .{byte})
             else
@@ -713,11 +735,18 @@ pub const Daemon = struct {
             // Scrolled up, its viewport stays pinned to the rows it shows.
             const viewer = self.attachedConn() orelse return;
             if (!viewer.copy_mode or !win.term.screens.active.viewportIsBottom()) return;
-            self.copyFrameTo(viewer) catch |err| {
-                log.warn("copy mode frame after output failed: {}", .{err});
-            };
+            viewer.view = .stale;
             return;
         };
+
+        // A client this far behind gets a frame once it has caught up,
+        // instead of more output.
+        if (conn.behind()) conn.view = .stale;
+        if (conn.view == .stale) {
+            win.feedDiscarded(cleaned);
+            self.noteBell(win, detached, now);
+            return;
+        }
 
         // Forward raw bytes, minus alternate-screen toggles: the client
         // canvas cannot switch screens. When the window switches, the
@@ -747,11 +776,7 @@ pub const Daemon = struct {
         // Repaint when the filter stripped a toggle, or when the active
         // screen changed by a path the filter cannot see (e.g. RIS), so
         // a fresh repaint and `.screen` reach the client either way.
-        if (result.switched or win.onAltScreen() != was_alt) {
-            self.repaintTo(conn) catch |err| {
-                log.warn("repaint after screen change failed: {}", .{err});
-            };
-        }
+        if (result.switched or win.onAltScreen() != was_alt) conn.view = .stale;
     }
 
     /// Consume the window's bell latch. A bell that rang while no client
@@ -840,25 +865,25 @@ pub const Daemon = struct {
 
     /// Start copy mode at the bottom of the history. The window stops
     /// passing output through, so it answers terminal queries itself.
-    fn enterCopyMode(self: *Daemon, conn: *Conn) !void {
+    fn enterCopyMode(self: *Daemon, conn: *Conn) void {
         const win = self.liveWindow() orelse return;
         win.term.scrollViewport(.bottom);
         conn.copy_mode = true;
         self.updatePassthrough();
-        try self.copyFrameTo(conn);
+        conn.view = .stale;
     }
 
-    fn leaveCopyMode(self: *Daemon, conn: *Conn) !void {
+    fn leaveCopyMode(self: *Daemon, conn: *Conn) void {
         const win = self.liveWindow() orelse return;
         win.term.scrollViewport(.bottom);
         conn.copy_mode = false;
         self.updatePassthrough();
-        try self.repaintTo(conn);
+        conn.view = .stale;
     }
 
     /// Scroll copy mode's view by the keys in `input`. Returns the bytes
     /// after a key that leaves copy mode, which are the window's input.
-    fn copyModeInput(self: *Daemon, conn: *Conn, input: []const u8) ![]const u8 {
+    fn copyModeInput(self: *Daemon, conn: *Conn, input: []const u8) []const u8 {
         const win = self.liveWindow() orelse return "";
         var rest = input;
         while (rest.len > 0) {
@@ -866,29 +891,32 @@ pub const Daemon = struct {
             rest = rest[key.len..];
             const action = key.action orelse continue;
             if (action == .exit) {
-                try self.leaveCopyMode(conn);
+                self.leaveCopyMode(conn);
                 return rest;
             }
             win.term.scrollViewport(copymode.viewportScroll(action, win.term.rows));
         }
-        try self.copyFrameTo(conn);
+        conn.view = .stale;
         return "";
     }
 
-    fn copyFrameTo(self: *Daemon, conn: *Conn) !void {
+    /// Send a stale canvas its fresh frame once the client has read
+    /// everything queued: a repaint, or in copy mode the viewport.
+    fn sendFrame(self: *Daemon, conn: *Conn) void {
+        if (conn.view != .stale or conn.out.items.len > 0) return;
         const win = self.liveWindow() orelse return;
-        const bytes = try win.copyModeFrame(self.alloc);
+        const bytes = (if (conn.copy_mode)
+            win.copyModeFrame(self.alloc)
+        else
+            win.repaint(self.alloc)) catch |err| {
+            log.warn("rendering a frame for the client failed: {}", .{err});
+            return;
+        };
         defer self.alloc.free(bytes);
-        conn.send(.output, bytes);
-    }
-
-    fn repaintTo(self: *Daemon, conn: *Conn) !void {
-        const win = self.liveWindow() orelse return;
-        const bytes = try win.repaint(self.alloc);
-        defer self.alloc.free(bytes);
-        // The repaint covers everything fed so far; resume passthrough
+        // The frame covers everything fed so far, so passthrough resumes
         // from a clean slate.
         win.alt_filter.reset();
+        conn.view = .current;
         conn.send(.output, bytes);
     }
 

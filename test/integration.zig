@@ -427,7 +427,11 @@ const PtyClient = struct {
     /// stream. Fails loudly with the captured output on timeout.
     fn waitFor(self: *PtyClient, needle: []const u8) !void {
         var deadline = Deadline.init(default_timeout_ms);
-        while (std.mem.indexOf(u8, self.output.items, needle) == null) {
+        // Search only output that could hold a new match, so a backlog of
+        // megabytes is scanned once rather than on every read.
+        var searched: usize = 0;
+        while (std.mem.indexOfPos(u8, self.output.items, searched, needle) == null) {
+            searched = self.output.items.len -| (needle.len - 1);
             const got = self.pump(100) catch |err| switch (err) {
                 error.ClientGone => {
                     if (std.mem.indexOf(u8, self.output.items, needle) != null) return;
@@ -1891,5 +1895,95 @@ test "copy mode scrolls the history and returns to the live screen" {
 
     try client.send("\x01d");
     try client.waitFor("detached from copy");
+    _ = try client.waitExit();
+}
+
+/// Attach a client to a new 50x200 session that waits for `go_path` to
+/// exist, then redraws its full screen 1200 times, 12 MB of output and more
+/// than the daemon queues for one client, and finally shows FLOOD-DONE and
+/// idles.
+fn spawnFloodSession(h: *Harness, session: []const u8, go_path: []const u8) !PtyClient {
+    const script = try std.fmt.allocPrint(
+        h.alloc,
+        "while [ ! -e {s} ]; do sleep 0.02; done; " ++
+            "awk 'BEGIN {{ for (i = 0; i < 1200; i++) {{ printf \"\\033[H\"; " ++
+            "for (r = 1; r < 50; r++) printf \"%0200d\\r\\n\", i; printf \"%0200d\", i }} }}'; " ++
+            "printf '\\033[2J\\033[HFLOOD-DONE'; exec sleep 600",
+        .{go_path},
+    );
+    defer h.alloc.free(script);
+    var client = try PtyClient.spawn(h, &.{ "new", session, "--", "sh", "-c", script }, 50, 200);
+    errdefer client.deinit();
+    try h.waitSessionUp(session);
+    try client.waitFor("\x1b[H\x1b[2J");
+    return client;
+}
+
+/// Wait until the session has written all of its flood, while the client
+/// reads nothing.
+fn waitFloodDone(h: *Harness, session: []const u8) !void {
+    var deadline = Deadline.init(60_000);
+    while (true) {
+        const result = try h.run(&.{ "peek", session });
+        defer h.alloc.free(result.stdout);
+        defer h.alloc.free(result.stderr);
+        if (std.mem.indexOf(u8, result.stdout, "FLOOD-DONE") != null) return;
+        try deadline.tick("the flood never finished");
+    }
+}
+
+test "a client that stops reading through a flood catches up instead of being dropped" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    const go_path = try std.fmt.allocPrint(alloc, "{s}/go", .{h.dir});
+    defer alloc.free(go_path);
+    var client = try spawnFloodSession(&h, "flood", go_path);
+    defer client.deinit();
+
+    // The client reads nothing while the session floods, so the daemon's
+    // queue for it fills past its limit.
+    try std.fs.cwd().writeFile(.{ .sub_path = go_path, .data = "" });
+    try waitFloodDone(&h, "flood");
+
+    // Reading again, the client drains its backlog and is repainted with
+    // the screen as it is now, still attached.
+    client.clearOutput();
+    try client.waitFor("FLOOD-DONE");
+    try client.send("\x01d");
+    try client.waitFor("detached from flood");
+    _ = try client.waitExit();
+}
+
+test "copy mode sends a client that stops reading a bounded number of frames" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    const go_path = try std.fmt.allocPrint(alloc, "{s}/go", .{h.dir});
+    defer alloc.free(go_path);
+    var client = try spawnFloodSession(&h, "copyflood", go_path);
+    defer client.deinit();
+    try client.send("\x01[");
+    try client.waitFor("]\x1b[0m");
+
+    // Copy mode at the bottom of the history follows the output with a
+    // frame for each read the daemon makes, while the client reads none.
+    try std.fs.cwd().writeFile(.{ .sub_path = go_path, .data = "" });
+    try waitFloodDone(&h, "copyflood");
+
+    // Frames wait for the client to read the previous ones, so only the
+    // few that fit in the socket and terminal buffers arrive, and then one
+    // of the screen as it is now. A frame for each read would be hundreds.
+    client.clearOutput();
+    try client.waitFor("FLOOD-DONE");
+    while (try client.pump(200)) {}
+    const frames = std.mem.count(u8, client.output.items, "\x1b[?2026h");
+    std.debug.print("copy mode frames after the flood: {d}\n", .{frames});
+    try std.testing.expect(frames < 50);
+
+    try client.send("q\x01d");
+    try client.waitFor("detached from copyflood");
     _ = try client.waitExit();
 }
