@@ -119,16 +119,18 @@ pub const commands = [_]Entry{
         \\usage: boo ls [--json]
         \\
         \\List sessions: name, attach state, idle time (time since the
-        \\last output or client input), and the session's title. Stale
-        \\sockets left by crashed daemons are cleaned up.
+        \\last output or client input), and the session's title. A
+        \\session that does not answer within a second is listed as
+        \\busy. Stale sockets left by crashed daemons are cleaned up.
         \\
         \\flags:
         \\  --json  emit a JSON array:
-        \\          [{"name","attached","idle_ms","unread",
+        \\          [{"name","responding","attached","idle_ms","unread",
         \\            "bell_idle_ms","pid","title"}]
         \\          ("unread" flags unseen output; "bell_idle_ms" is the
         \\           age of a bell rung while away, -1 if none; "pid" is
         \\           the session command's pid, -1 once it has exited)
+        \\          A busy session has only "name" and "responding".
         \\
         ,
     },
@@ -318,8 +320,8 @@ pub const topics = [_]Entry{
         \\  control keys; stdin mode is binary safe.
         \\
         \\machine-readable output:
-        \\  boo ls --json    [{"name","attached","idle_ms","unread",
-        \\                    "bell_idle_ms","pid","title"}]
+        \\  boo ls --json    [{"name","responding","attached","idle_ms",
+        \\                    "unread","bell_idle_ms","pid","title"}]
         \\  boo peek --json  {"session","title","rows","cols",
         \\                    "cursor":{"row","col"},"screen"}
         \\

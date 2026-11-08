@@ -200,18 +200,55 @@ pub const SessionInfo = struct {
     title: []const u8,
 };
 
-/// Query a session daemon, deleting the socket when the daemon is gone.
-/// A non-null `timeout_ms` bounds the control round-trip so a slow daemon
-/// cannot hang the caller. A daemon that does not answer reports no info,
-/// and its socket stays unless no daemon holds the session's name.
-pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, timeout_ms: ?u32) !?SessionInfo {
+/// What a session's daemon did with a control command.
+const ControlReply = union(enum) {
+    result: client.ControlResult,
+    /// The daemon holds the session's name but did not take the command
+    /// in time.
+    busy,
+    /// No daemon holds the name, and its socket, if any, is deleted.
+    gone,
+};
+
+/// Run a control command against a session, telling a daemon that is
+/// gone from one that is slow. A non-null `timeout_ms` bounds the round
+/// trip so a slow daemon cannot hang the caller.
+fn controlSession(
+    alloc: std.mem.Allocator,
+    dir: []const u8,
+    name: []const u8,
+    argv: []const []const u8,
+    timeout_ms: ?u32,
+) !ControlReply {
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
-    const result = client.control(alloc, sock, &.{"info"}, timeout_ms) catch |err| {
-        // A timeout means the daemon is busy, not gone; keep the socket.
-        if (err == error.Timeout) return null;
-        _ = claimpkg.removeStale(alloc, dir, name) catch {};
-        return null;
+    const result = client.control(alloc, sock, argv, timeout_ms) catch |err| switch (err) {
+        error.Timeout => return .busy,
+        // A daemon refuses connections while its backlog is full, and an
+        // EOF may mean it died before replying, so only a free lock shows
+        // that it is gone.
+        error.FileNotFound, error.ConnectionRefused, error.ConnectionLost => {
+            const stale = try claimpkg.removeStale(alloc, dir, name);
+            return if (stale) .gone else .busy;
+        },
+        else => return err,
+    };
+    return .{ .result = result };
+}
+
+/// What a session's daemon said when asked for its info.
+pub const InfoReply = union(enum) {
+    info: SessionInfo,
+    busy,
+    gone,
+};
+
+/// Query a session daemon, deleting the socket when the daemon is gone.
+pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, timeout_ms: u32) !InfoReply {
+    const result = switch (try controlSession(alloc, dir, name, &.{"info"}, timeout_ms)) {
+        .result => |result| result,
+        .busy => return .busy,
+        .gone => return .gone,
     };
     errdefer alloc.free(result.text);
     if (!result.ok) return error.BadResponse;
@@ -229,38 +266,33 @@ pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, 
     const pid = std.fmt.parseInt(posix.pid_t, it.next() orelse return error.BadResponse, 10) catch
         return error.BadResponse;
     return .{
-        .text = result.text,
-        .attached = attached,
-        .idle_ms = idle_ms,
-        .out_idle_ms = out_idle_ms,
-        .unread = unread,
-        .bell_idle_ms = bell_idle_ms,
-        .pid = pid,
-        // The daemon strips control bytes from the title, so it holds no
-        // tab and runs to the end of the payload.
-        .title = it.rest(),
+        .info = .{
+            .text = result.text,
+            .attached = attached,
+            .idle_ms = idle_ms,
+            .out_idle_ms = out_idle_ms,
+            .unread = unread,
+            .bell_idle_ms = bell_idle_ms,
+            .pid = pid,
+            // The daemon strips control bytes from the title, so it holds no
+            // tab and runs to the end of the payload.
+            .title = it.rest(),
+        },
     };
 }
 
 /// Run a control command against a session, mapping a missing or
-/// mid-teardown daemon to the documented exit code. An EOF on the
-/// control connection means the daemon died before replying, so it is
-/// reported the same as a daemon that is already gone.
+/// mid-teardown daemon to the documented exit code.
 fn mustControl(
     alloc: std.mem.Allocator,
     dir: []const u8,
     name: []const u8,
     argv: []const []const u8,
 ) !client.ControlResult {
-    const sock = try paths.socketPath(alloc, dir, name);
-    defer alloc.free(sock);
-    return client.control(alloc, sock, argv, null) catch |err| switch (err) {
-        error.FileNotFound, error.ConnectionRefused, error.ConnectionLost => fail(
-            exit_no_session,
-            "no session named {s}",
-            .{name},
-        ),
-        else => return err,
+    return switch (try controlSession(alloc, dir, name, argv, null)) {
+        .result => |result| result,
+        .busy => fail(exit_runtime, "session {s} is not accepting connections; try again", .{name}),
+        .gone => fail(exit_no_session, "no session named {s}", .{name}),
     };
 }
 
@@ -406,6 +438,10 @@ fn attachLoop(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void
     }
 }
 
+/// How long `ls` waits for each session's daemon before listing the
+/// session as busy.
+const ls_timeout_ms = 1000;
+
 fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var json = false;
     for (args) |arg| {
@@ -428,56 +464,70 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
-    var live: usize = 0;
     var name_width: usize = 4;
-    var infos: std.ArrayList(struct { name: []const u8, info: SessionInfo }) = .empty;
+    var replies: std.ArrayList(struct { name: []const u8, reply: InfoReply }) = .empty;
     defer {
-        for (infos.items) |entry| alloc.free(entry.info.text);
-        infos.deinit(alloc);
+        for (replies.items) |entry| switch (entry.reply) {
+            .info => |info| alloc.free(info.text),
+            .busy, .gone => {},
+        };
+        replies.deinit(alloc);
     }
     for (sessions) |name| {
-        const info = sessionInfo(alloc, dir, name, null) catch continue orelse continue;
-        try infos.append(alloc, .{ .name = name, .info = info });
+        const reply = sessionInfo(alloc, dir, name, ls_timeout_ms) catch continue;
+        if (reply == .gone) continue;
+        try replies.append(alloc, .{ .name = name, .reply = reply });
         name_width = @max(name_width, name.len);
-        live += 1;
     }
 
     if (json) {
         try out.append(alloc, '[');
-        for (infos.items, 0..) |entry, i| {
+        for (replies.items, 0..) |entry, i| {
             if (i > 0) try out.append(alloc, ',');
             try out.appendSlice(alloc, "{\"name\":");
             try appendJsonString(alloc, &out, entry.name);
-            const tail = try std.fmt.allocPrint(alloc, ",\"attached\":{},\"idle_ms\":{d},\"unread\":{},\"bell_idle_ms\":{d},\"pid\":{d},\"title\":", .{
-                entry.info.attached,
-                entry.info.idle_ms,
-                entry.info.unread,
-                entry.info.bell_idle_ms,
-                entry.info.pid,
+            const info = switch (entry.reply) {
+                .info => |info| info,
+                .busy => {
+                    try out.appendSlice(alloc, ",\"responding\":false}");
+                    continue;
+                },
+                .gone => unreachable,
+            };
+            const tail = try std.fmt.allocPrint(alloc, ",\"responding\":true,\"attached\":{},\"idle_ms\":{d},\"unread\":{},\"bell_idle_ms\":{d},\"pid\":{d},\"title\":", .{
+                info.attached,
+                info.idle_ms,
+                info.unread,
+                info.bell_idle_ms,
+                info.pid,
             });
             defer alloc.free(tail);
             try out.appendSlice(alloc, tail);
-            try appendJsonString(alloc, &out, entry.info.title);
+            try appendJsonString(alloc, &out, info.title);
             try out.append(alloc, '}');
         }
         try out.appendSlice(alloc, "]\n");
         return stdoutWrite(out.items);
     }
 
-    if (live == 0) {
+    if (replies.items.len == 0) {
         return stdoutPrint(alloc, "No sessions in {s}.\n", .{dir});
     }
 
     try appendPadded(alloc, &out, "NAME", name_width);
     try out.appendSlice(alloc, "  STATE     IDLE  TITLE\n");
-    for (infos.items) |entry| {
+    for (replies.items) |entry| {
         try appendPadded(alloc, &out, entry.name, name_width);
         var idle_buf: [32]u8 = undefined;
-        const line = try std.fmt.allocPrint(alloc, "  {s: <8}  {s: <4}  {s}\n", .{
-            if (entry.info.attached) "attached" else "detached",
-            fmtIdle(&idle_buf, entry.info.idle_ms),
-            entry.info.title,
-        });
+        const line = switch (entry.reply) {
+            .info => |info| try std.fmt.allocPrint(alloc, "  {s: <8}  {s: <4}  {s}\n", .{
+                if (info.attached) "attached" else "detached",
+                fmtIdle(&idle_buf, info.idle_ms),
+                info.title,
+            }),
+            .busy => try alloc.dupe(u8, "  busy      -\n"),
+            .gone => unreachable,
+        };
         defer alloc.free(line);
         try out.appendSlice(alloc, line);
     }
@@ -744,19 +794,30 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (true) {
-        if (text) |needle| {
-            const result = try mustControl(alloc, dir, name, &.{ "peek", "screen" });
+        // Every call stops at the deadline, so a daemon that has stopped
+        // answering cannot hold the wait past it.
+        const remaining_ms = @max(deadline - std.time.milliTimestamp(), 1);
+        const call_timeout_ms: u32 = @intCast(@min(remaining_ms, std.math.maxInt(u32)));
+        const met = if (text) |needle| met: {
+            const result = switch (try controlSession(alloc, dir, name, &.{ "peek", "screen" }, call_timeout_ms)) {
+                .result => |result| result,
+                .busy => break :met false,
+                .gone => fail(exit_no_session, "no session named {s}", .{name}),
+            };
             defer alloc.free(result.text);
             if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
             const peek = parsePeek(result.text) orelse
                 fail(exit_runtime, "malformed peek response", .{});
-            if (std.mem.indexOf(u8, peek.screen, needle) != null) return;
-        } else {
-            const info = try sessionInfo(alloc, dir, name, null) orelse
-                fail(exit_no_session, "no session named {s}", .{name});
-            defer alloc.free(info.text);
-            if (info.out_idle_ms >= idle_settle_ms) return;
-        }
+            break :met std.mem.indexOf(u8, peek.screen, needle) != null;
+        } else switch (try sessionInfo(alloc, dir, name, call_timeout_ms)) {
+            .info => |info| met: {
+                defer alloc.free(info.text);
+                break :met info.out_idle_ms >= idle_settle_ms;
+            },
+            .busy => false,
+            .gone => fail(exit_no_session, "no session named {s}", .{name}),
+        };
+        if (met) return;
         if (std.time.milliTimestamp() >= deadline) {
             fail(exit_timeout, "wait: timed out after {s}", .{timeout_str});
         }
@@ -793,13 +854,11 @@ fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             alloc.free(sessions);
         }
         for (sessions) |name| {
-            const sock = try paths.socketPath(alloc, dir, name);
-            defer alloc.free(sock);
-            const result = client.control(alloc, sock, &.{"quit"}, null) catch {
-                _ = claimpkg.removeStale(alloc, dir, name) catch {};
-                continue;
-            };
-            alloc.free(result.text);
+            const reply = controlSession(alloc, dir, name, &.{"quit"}, null) catch continue;
+            switch (reply) {
+                .result => |result| alloc.free(result.text),
+                .busy, .gone => continue,
+            }
             try stdoutPrint(alloc, "{s}\n", .{name});
         }
         return;

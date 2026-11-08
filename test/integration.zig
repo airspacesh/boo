@@ -19,6 +19,21 @@ extern "c" fn kill(pid: std.c.pid_t, sig: c_int) c_int;
 
 const default_timeout_ms: u64 = 10_000;
 
+/// How long a single CLI command may run before the harness kills it.
+const command_limit_ms: i64 = 30_000;
+
+/// Kill `pid` unless `done` is set within `limit_ms`.
+fn killAfter(pid: posix.pid_t, done: *std.atomic.Value(bool), limit_ms: i64) void {
+    const deadline = std.time.milliTimestamp() + limit_ms;
+    while (!done.load(.acquire)) {
+        if (std.time.milliTimestamp() >= deadline) {
+            _ = kill(pid, posix.SIG.KILL);
+            return;
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+}
+
 /// Terminal ioctl request codes; Zig's std lacks the darwin set variants.
 const Tio = switch (@import("builtin").os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => struct {
@@ -85,14 +100,31 @@ const Harness = struct {
         defer env.deinit();
         try env.put("BOO_DIR", self.dir);
 
-        return std.process.Child.run(.{
-            .allocator = self.alloc,
-            .argv = full_argv.items,
-            .cwd = cwd,
-            .env_map = &env,
-            // Room for a full peek of a big session's history.
-            .max_output_bytes = 4 << 20,
-        });
+        var child = std.process.Child.init(full_argv.items, self.alloc);
+        child.cwd = cwd;
+        child.env_map = &env;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        try child.spawn();
+
+        // A command that hangs is killed, so the test fails instead of
+        // stalling the whole run.
+        var done = std.atomic.Value(bool).init(false);
+        const watchdog = try std.Thread.spawn(.{}, killAfter, .{ child.id, &done, command_limit_ms });
+        var stdout: std.ArrayList(u8) = .empty;
+        defer stdout.deinit(self.alloc);
+        var stderr: std.ArrayList(u8) = .empty;
+        defer stderr.deinit(self.alloc);
+        // Room for a full peek of a big session's history.
+        const collected = child.collectOutput(self.alloc, &stdout, &stderr, 4 << 20);
+        done.store(true, .release);
+        watchdog.join();
+        const term = try child.wait();
+        try collected;
+
+        const out = try stdout.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(out);
+        return .{ .term = term, .stdout = out, .stderr = try stderr.toOwnedSlice(self.alloc) };
     }
 
     /// Run a CLI command and require exit code 0.
@@ -1875,7 +1907,8 @@ test "session commands start with default SIGHUP and SIGPIPE handling" {
 /// Stand in for a live daemon that refuses connections, as one does
 /// between bind and listen or with a full backlog. Holds the session's
 /// lock (see src/claim.zig) and binds its socket without listening.
-/// Returns the lock fd and the socket fd.
+/// Returns the lock fd and the socket fd, on which a caller may listen
+/// to stand in for a daemon that accepts nothing.
 fn holdUnresponsiveSession(h: *Harness, name: []const u8) ![2]posix.fd_t {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const lock_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.lock", .{ h.dir, name });
@@ -1937,6 +1970,36 @@ test "sockets and their directory are reachable by their owner only" {
     try std.testing.expect(std.mem.indexOf(u8, ls.stderr, h.dir) != null);
     const dir_stat = try posix.fstatat(posix.AT.FDCWD, h.dir, 0);
     try std.testing.expectEqual(0o755, dir_stat.mode & 0o777);
+}
+
+test "a daemon that stops answering cannot hang ls or wait" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    const held = try holdUnresponsiveSession(&h, "wedged");
+    defer for (held) |fd| posix.close(fd);
+    try posix.listen(held[1], 1);
+    try h.startDetached("fine", &.{"cat"});
+
+    // ls lists the wedged session as busy, after the healthy one's info.
+    const ls = try h.run(&.{"ls"});
+    defer alloc.free(ls.stdout);
+    defer alloc.free(ls.stderr);
+    try std.testing.expect(ls.term == .Exited and ls.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "busy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "cat") != null);
+
+    const json = try h.run(&.{ "ls", "--json" });
+    defer alloc.free(json.stdout);
+    defer alloc.free(json.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, json.stdout, "{\"name\":\"wedged\",\"responding\":false}") != null);
+
+    // wait gives up at its deadline, whichever call is in flight.
+    const start = std.time.milliTimestamp();
+    try h.runExit(&.{ "wait", "wedged", "--idle", "--timeout", "1s" }, 4);
+    try h.runExit(&.{ "wait", "wedged", "--text", "x", "--timeout", "1s" }, 4);
+    try std.testing.expect(std.time.milliTimestamp() - start < 5000);
 }
 
 /// Render raw client output through a terminal emulator and return

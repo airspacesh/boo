@@ -35,10 +35,23 @@ fn handleSignal(sig: c_int) callconv(.c) void {
     }
 }
 
-pub fn connect(alloc: std.mem.Allocator, socket_path: []const u8) !posix.fd_t {
+/// Connect to a session socket. A non-null `send_timeout_ms` bounds
+/// connect and every later write on the socket (SO_SNDTIMEO), which
+/// otherwise block while a stopped daemon's backlog or buffer is full.
+/// Either then fails with error.WouldBlock.
+pub fn connect(alloc: std.mem.Allocator, socket_path: []const u8, send_timeout_ms: ?u32) !posix.fd_t {
     _ = alloc;
     const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
     errdefer posix.close(fd);
+    if (send_timeout_ms) |ms| {
+        // A zero timeval means no timeout at all.
+        const nonzero_ms = @max(ms, 1);
+        const tv: posix.timeval = .{
+            .sec = @intCast(nonzero_ms / std.time.ms_per_s),
+            .usec = @intCast(nonzero_ms % std.time.ms_per_s * std.time.us_per_ms),
+        };
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+    }
     var addr: posix.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
     if (socket_path.len >= addr.path.len) return error.NameTooLong;
     @memset(&addr.path, 0);
@@ -53,7 +66,7 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     const tty: posix.fd_t = 0;
     if (!posix.isatty(tty)) return error.NotATty;
 
-    const sock = try connect(alloc, socket_path);
+    const sock = try connect(alloc, socket_path, null);
     defer posix.close(sock);
 
     // Signal plumbing: SIGWINCH resizes, SIGTERM/SIGHUP detach.
@@ -488,31 +501,38 @@ pub const ControlResult = struct {
 };
 
 /// Send a single control command (-X) and wait for the reply. When
-/// `timeout_ms` is non-null, give up with `error.Timeout` if no reply
-/// arrives in that window, so a caller cannot hang forever on a daemon
-/// that has stopped answering.
+/// `timeout_ms` is non-null, give up with `error.Timeout` once the
+/// daemon has not taken the command and replied within about that long,
+/// so a caller cannot hang forever on a daemon that has stopped
+/// answering.
 pub fn control(
     alloc: std.mem.Allocator,
     socket_path: []const u8,
     argv: []const []const u8,
     timeout_ms: ?u32,
 ) !ControlResult {
-    const sock = try connect(alloc, socket_path);
+    const deadline: ?i64 = if (timeout_ms) |ms|
+        std.time.milliTimestamp() + ms
+    else
+        null;
+    const sock = connect(alloc, socket_path, timeout_ms) catch |err| switch (err) {
+        error.WouldBlock => return error.Timeout,
+        else => return err,
+    };
     defer posix.close(sock);
 
     const payload = try protocol.encodeArgv(alloc, argv);
     defer alloc.free(payload);
-    try protocol.writeMsg(sock, .command, payload);
+    protocol.writeMsg(sock, .command, payload) catch |err| switch (err) {
+        error.WouldBlock => return error.Timeout,
+        else => return err,
+    };
 
     var decoder: protocol.Decoder = .init(alloc);
     defer decoder.deinit();
     var reply: std.ArrayList(u8) = .empty;
     defer reply.deinit(alloc);
     var buf: [4096]u8 = undefined;
-    const deadline: ?i64 = if (timeout_ms) |ms|
-        std.time.milliTimestamp() + ms
-    else
-        null;
     while (true) {
         if (deadline) |dl| {
             const now = std.time.milliTimestamp();
