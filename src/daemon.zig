@@ -450,10 +450,9 @@ pub const Daemon = struct {
         // would EOF or garble the program the user just left.
         if (!conn.attached) return;
         switch (cmd) {
-            .forward => |bytes| if (conn.copy_mode) {
-                try self.copyModeInput(conn, bytes);
-            } else if (self.liveWindow()) |w| {
-                w.writeInput(bytes) catch {};
+            .forward => |bytes| {
+                const window_bytes = if (conn.copy_mode) try self.copyModeInput(conn, bytes) else bytes;
+                if (self.liveWindow()) |w| w.writeInput(window_bytes) catch {};
             },
             .detach => |byte| self.detachConn(
                 conn,
@@ -860,17 +859,23 @@ pub const Daemon = struct {
         try self.repaintTo(conn);
     }
 
-    fn copyModeInput(self: *Daemon, conn: *Conn, input: []const u8) !void {
-        const win = self.liveWindow() orelse return;
+    /// Scroll copy mode's view by the keys in `input`. Returns the bytes
+    /// after a key that leaves copy mode, which are the window's input.
+    fn copyModeInput(self: *Daemon, conn: *Conn, input: []const u8) ![]const u8 {
+        const win = self.liveWindow() orelse return "";
         var rest = input;
         while (rest.len > 0) {
             const key = copymode.decodeKey(rest);
             rest = rest[key.len..];
             const action = key.action orelse continue;
-            if (action == .exit) return self.leaveCopyMode(conn);
+            if (action == .exit) {
+                try self.leaveCopyMode(conn);
+                return rest;
+            }
             win.term.scrollViewport(copymode.viewportScroll(action, win.term.rows));
         }
         try self.copyFrameTo(conn);
+        return "";
     }
 
     fn copyFrameTo(self: *Daemon, conn: *Conn) !void {

@@ -1496,6 +1496,32 @@ test "modifyOtherKeys apps: encoded C-a still detaches" {
     try std.testing.expectEqual(@as(u32, 0), try second.waitExit());
 }
 
+test "copy mode: keys typed after q in the same read reach the shell" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("copytail", &.{"sh"});
+    try h.sendLine("copytail", "echo READY-$((1+1))");
+    const ready = try h.waitPeekContains("copytail", "READY-2");
+    alloc.free(ready);
+
+    var client = try PtyClient.spawn(&h, &.{ "attach", "copytail" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("READY-2");
+
+    client.clearOutput();
+    try client.send("\x01[");
+    const frame = try waitCopyFrame(alloc, &client, 24, 80);
+    alloc.free(frame);
+
+    // Fast typing, a paste, or a remote link can bring q and the next
+    // command in one read. The command runs once q leaves copy mode.
+    try client.send("qecho TAIL-$((6*7))\r");
+    const tail = try h.waitPeekContains("copytail", "TAIL-42");
+    alloc.free(tail);
+}
+
 test "copy mode: Esc leaves at once when another key follows in the same read" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
