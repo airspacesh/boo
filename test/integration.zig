@@ -1622,6 +1622,9 @@ test "exit codes distinguish usage, missing sessions, and ambiguity" {
     try h.runExit(&.{ "attach", "alp" }, 1);
     try h.runExit(&.{ "attach", "al" }, 3);
     try h.runExit(&.{ "attach", "nosuchzz" }, 3);
+    // --exact refuses a prefix, and takes the exact name.
+    try h.runExit(&.{ "attach", "--exact", "alp" }, 3);
+    try h.runExit(&.{ "attach", "--exact", "alpha" }, 1);
     // Every other command takes the exact name only.
     try h.runOk(&.{ "peek", "alpha" });
     try h.runExit(&.{ "peek", "alp" }, 3);

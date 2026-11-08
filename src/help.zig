@@ -49,8 +49,8 @@ pub const overview =
     \\
     \\session selection:
     \\  attach accepts a unique prefix of the session name (e.g.
-    \\  'pane attach bu' for "build"). Other commands take the exact
-    \\  name.
+    \\  'pane attach bu' for "build") unless given --exact. Other
+    \\  commands take the exact name.
     \\
     \\environment:
     \\  PANE_DIR  socket directory
@@ -96,7 +96,7 @@ pub const commands = [_]Entry{
         .name = "attach",
         .alias = "at",
         .body =
-        \\usage: pane attach <name>
+        \\usage: pane attach [--exact] <name>
         \\       pane at <name>
         \\       pane a <name>
         \\
@@ -106,7 +106,9 @@ pub const commands = [_]Entry{
         \\(the session is stolen). Attaching the session you are inside
         \\is refused.
         \\
-        \\A unique prefix of the name is accepted.
+        \\A unique prefix of the name is accepted, unless --exact asks
+        \\for the exact name, as a script that must not pick up another
+        \\session would.
         \\
         \\Inside the session, press C-a d to detach. See 'pane help
         \\keys' for all bindings.
@@ -114,6 +116,7 @@ pub const commands = [_]Entry{
         \\examples:
         \\  pane attach build     reattach "build"
         \\  pane at bu            the same, by prefix
+        \\  pane at --exact ai    "ai" only, never "ai-tools"
         \\
         ,
     },

@@ -343,8 +343,13 @@ fn createSession(
 
 fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var name_arg: ?[]const u8 = null;
+    var exact = false;
     for (args) |arg| {
         if (isHelpFlag(arg)) return printHelpPage("attach");
+        if (std.mem.eql(u8, arg, "--exact")) {
+            exact = true;
+            continue;
+        }
         if (arg.len > 0 and arg[0] == '-') usageFail("attach", "unknown flag '{s}'", .{arg});
         if (name_arg != null) usageFail("attach", "unexpected argument '{s}'", .{arg});
         name_arg = arg;
@@ -353,6 +358,10 @@ fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try socketDir(alloc);
     defer alloc.free(dir);
+    if (exact) {
+        try requireSession(alloc, dir, want);
+        return attachLoop(alloc, dir, want);
+    }
     const name = try resolvePrefix(alloc, dir, want);
     defer alloc.free(name);
     try attachLoop(alloc, dir, name);
