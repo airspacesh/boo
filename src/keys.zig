@@ -125,6 +125,14 @@ pub const Parser = struct {
                     continue;
                 }
                 self.pending = false;
+                if (byte >= 0x80) {
+                    // A non-ASCII character is one command key, however
+                    // many bytes it spans, and none is bound.
+                    i += utf8CharLen(input[i..]);
+                    start = i;
+                    try handler.command(.{ .unknown = '?' });
+                    continue;
+                }
                 i += 1;
                 start = i;
                 try dispatch(byte, handler);
@@ -298,6 +306,15 @@ pub const Parser = struct {
         }
     }
 };
+
+/// How many bytes of `input` the UTF-8 character at its start spans,
+/// counting its lead byte and the continuation bytes present after it.
+fn utf8CharLen(input: []const u8) usize {
+    const want = std.unicode.utf8ByteSequenceLength(input[0]) catch 1;
+    var len: usize = 1;
+    while (len < want and len < input.len and input[len] & 0xc0 == 0x80) len += 1;
+    return len;
+}
 
 /// A decoded kitty CSI-u key. `cp` is the unshifted unicode
 /// codepoint, `mods` the raw kitty modifier value (1 means none; the
@@ -507,6 +524,19 @@ test "unknown command reported" {
     var p: Parser = .{};
     try p.feed("\x01z", .{}, &h);
     try std.testing.expectEqual(Command{ .unknown = 'z' }, h.cmds.items[0]);
+}
+
+test "a multibyte character after C-a is one unknown command key" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{};
+    // Neither e-acute (2 bytes) nor the euro sign (3 bytes) reaches
+    // the window, and the key after them does.
+    try p.feed("\x01\xc3\xa9\x01\xe2\x82\xacx", .{}, &h);
+    try std.testing.expectEqualStrings("x", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 2), h.cmds.items.len);
+    try std.testing.expectEqual(Command{ .unknown = '?' }, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .unknown = '?' }, h.cmds.items[1]);
 }
 
 test "kitty: encoded Ctrl+A starts the prefix, plain d detaches" {
