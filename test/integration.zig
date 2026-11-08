@@ -1496,6 +1496,40 @@ test "modifyOtherKeys apps: encoded C-a still detaches" {
     try std.testing.expectEqual(@as(u32, 0), try second.waitExit());
 }
 
+test "copy mode: Esc leaves at once when another key follows in the same read" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The app reads raw bytes one at a time and prints each in hex.
+    const script = "stty raw -echo; printf 'COPY-%s\\r\\n' ON; " ++
+        "head -c 1 | od -An -tx1; head -c 1 | od -An -tx1; exec sleep 60";
+    var client = try PtyClient.spawn(&h, &.{ "new", "copyesc", "--", "sh", "-c", script }, 24, 80);
+    defer client.deinit();
+    try h.waitSessionUp("copyesc");
+    try client.waitFor("COPY-ON");
+
+    // Esc then q in one read: the Esc leaves copy mode, and the q
+    // reaches the app.
+    client.clearOutput();
+    try client.send("\x01[");
+    const first = try waitCopyFrame(alloc, &client, 24, 80);
+    alloc.free(first);
+    try client.send("\x1bq");
+    const q = try h.waitPeekContains("copyesc", " 71");
+    alloc.free(q);
+
+    // Two Esc presses in one read: the first leaves copy mode, and the
+    // second reaches the app.
+    client.clearOutput();
+    try client.send("\x01[");
+    const second = try waitCopyFrame(alloc, &client, 24, 80);
+    alloc.free(second);
+    try client.send("\x1b\x1b");
+    const esc = try h.waitPeekContains("copyesc", " 1b");
+    alloc.free(esc);
+}
+
 test "modifyOtherKeys apps: Esc and C-a Esc act without waiting for another key" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

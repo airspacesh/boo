@@ -1,7 +1,10 @@
 //! Prefix-key (C-a) input processing, GNU screen style.
 //!
 //! Raw client input is scanned for the escape byte. Bytes that are not
-//! part of a command pass through to the active window unchanged.
+//! part of a command pass through to the active window unchanged. The
+//! parser holds an escape sequence until it completes, or until
+//! `hold_timeout_ms` passes without the rest, and passes it on whole,
+//! so copy mode decodes whole keys even when they split across reads.
 //!
 //! When the active window has the kitty keyboard protocol or xterm
 //! modifyOtherKeys (mode 2) enabled, the attached client's real
@@ -24,9 +27,8 @@ pub const hold_timeout_ms: u64 = 50;
 
 /// Which keyboard protocols the client's real terminal currently has
 /// active, mirrored from the focused window or view. Gates which
-/// input encodings the parsers decode; everything else is held only
-/// long enough to know it is not an encoded prefix, then replayed
-/// verbatim.
+/// input encodings the parser decodes. Every other escape sequence is
+/// replayed verbatim once it completes.
 pub const Protocols = struct {
     /// Kitty keyboard protocol: CSI-u keys decode.
     kitty: bool = false,
@@ -52,12 +54,12 @@ pub const Command = union(enum) {
 pub const Parser = struct {
     /// Whether the previous byte ended inside a prefix sequence.
     pending: bool = false,
-    /// Encoded-key candidate bytes held until the sequence either
-    /// completes or diverges (it can split across reads).
+    /// Escape sequence bytes held until the sequence either completes
+    /// or diverges (it can split across reads).
     held: [held_max]u8 = undefined,
     held_len: u8 = 0,
-    /// Protocol state of the most recent feed; gates which finals the
-    /// hold grammar accepts and which sequences decode.
+    /// Protocol state of the most recent feed, which gates which
+    /// complete sequences decode.
     prot: Protocols = .{},
 
     const held_max = 48;
@@ -75,9 +77,6 @@ pub const Parser = struct {
     /// variants (`C-a C-d` detaches like `C-a d`).
     pub fn feed(self: *Parser, input: []const u8, prot: Protocols, handler: anytype) !void {
         self.prot = prot;
-        // The terminal left every keyboard protocol while a candidate
-        // was held: the bytes belong to the window after all.
-        if (!prot.any() and self.held_len > 0) try self.flushHeld(handler);
 
         var start: usize = 0;
         var i: usize = 0;
@@ -90,30 +89,32 @@ pub const Parser = struct {
                     self.held_len += 1;
                     i += 1;
                     start = i;
-                    if (byte == 'u') {
-                        try self.finishCsiU(handler);
-                    } else if (byte == '~') {
-                        try self.finishModify(handler);
+                    if (self.heldComplete()) {
+                        try self.finishHeld(handler);
                     } else if (self.held_len == held_max) {
                         try self.flushHeld(handler);
                     }
                 } else {
-                    // Diverged: not a sequence we intercept. Replay the
-                    // held bytes, then re-examine this byte normally.
+                    // Diverged: the ESC stands alone or the sequence
+                    // broke off. Replay the held bytes, then re-examine
+                    // this byte normally.
                     try self.flushHeld(handler);
                 }
                 continue;
             }
 
+            if (byte == 0x1b) {
+                // An escape sequence may be an encoded prefix or command
+                // key, and copy mode decodes whole keys.
+                if (i > start) try handler.command(.{ .forward = input[start..i] });
+                self.held[0] = byte;
+                self.held_len = 1;
+                i += 1;
+                start = i;
+                continue;
+            }
+
             if (self.pending) {
-                if (prot.any() and byte == 0x1b) {
-                    // The command key may arrive encoded.
-                    self.held[0] = byte;
-                    self.held_len = 1;
-                    i += 1;
-                    start = i;
-                    continue;
-                }
                 if (byte == escape_byte) {
                     // The prefix key repeating (held a beat too long)
                     // or pressed again: stay armed instead of
@@ -138,15 +139,6 @@ pub const Parser = struct {
                 continue;
             }
 
-            if (prot.any() and byte == 0x1b) {
-                if (i > start) try handler.command(.{ .forward = input[start..i] });
-                self.held[0] = byte;
-                self.held_len = 1;
-                i += 1;
-                start = i;
-                continue;
-            }
-
             i += 1;
         }
 
@@ -160,25 +152,34 @@ pub const Parser = struct {
         return self.held_len > 0;
     }
 
-    /// Whether `byte` keeps the held bytes a viable candidate for an
-    /// encoded key this parser may intercept:
-    /// `ESC [ <digits...> [;:] ... u` (kitty CSI-u) or
-    /// `ESC [ 27 ; mods ; cp ~` (modifyOtherKeys). The finals are
-    /// gated on the matching protocol being active; the digit body is
-    /// shared. Codepoints are not matched structurally here because a
-    /// non-Latin layout's prefix key reports the layout codepoint
-    /// first and the standard-layout key in a subfield, so any
-    /// complete key may turn out to be the prefix.
+    /// Whether `byte` continues the held escape sequence: a CSI
+    /// (`ESC [`, parameter and intermediate bytes, then a final byte)
+    /// or an SS3 (`ESC O` and one more byte), as ECMA-48 section 5.4
+    /// lays them out. Any other ESC stands alone.
     fn heldAccepts(self: *const Parser, byte: u8) bool {
-        const len = self.held_len;
-        if (len == 1) return byte == '[';
-        if (len == 2) return byte >= '0' and byte <= '9';
-        return switch (byte) {
-            '0'...'9', ';', ':' => true,
-            'u' => self.prot.kitty,
-            '~' => self.prot.modify,
-            else => false,
-        };
+        if (self.held_len == 1) return byte == '[' or byte == 'O';
+        return byte >= 0x20 and byte <= 0x7e;
+    }
+
+    /// Whether the held escape sequence has ended: an SS3 with its one
+    /// byte, or a CSI with its final byte (0x40 to 0x7e).
+    fn heldComplete(self: *const Parser) bool {
+        if (self.held[1] == 'O') return self.held_len == 3;
+        return self.held_len > 2 and self.held[self.held_len - 1] >= 0x40;
+    }
+
+    /// A complete escape sequence is in the hold buffer. Decode it when
+    /// it may be an encoded key under an active protocol. The
+    /// codepoint is not matched here because a non-Latin layout's
+    /// prefix key reports the layout codepoint first and the
+    /// standard-layout key in a subfield, so any complete key may turn
+    /// out to be the prefix.
+    fn finishHeld(self: *Parser, handler: anytype) !void {
+        const csi = self.held[1] == '[';
+        const final = self.held[self.held_len - 1];
+        if (csi and final == 'u' and self.prot.kitty) return self.finishCsiU(handler);
+        if (csi and final == '~' and self.prot.modify) return self.finishModify(handler);
+        return self.flushHeld(handler);
     }
 
     /// A complete `ESC [ ... u` sequence is in the hold buffer.
@@ -488,6 +489,18 @@ test "holding the prefix key stays armed until a command key" {
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
+test "an escape sequence split across reads passes on whole" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{};
+    // Copy mode decodes what the parser passes on, so an arrow key
+    // split after its ESC must not reach it as a lone Esc.
+    try p.feed("\x1b", .{}, &h);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    try p.feed("[A", .{}, &h);
+    try std.testing.expectEqualStrings("\x1b[A", h.forwarded.items);
+}
+
 test "unknown command reported" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
@@ -651,7 +664,7 @@ test "kitty: CSI-u encodings pass through when kitty mode is off" {
     try std.testing.expectEqual(@as(usize, 0), h.cmds.items.len);
 }
 
-test "kitty: hold flushed when kitty mode turns off mid-sequence" {
+test "kitty: a sequence completing after kitty mode turns off passes through" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: Parser = .{};

@@ -49,15 +49,17 @@ pub fn decodeKey(input: []const u8) Key {
     };
 }
 
-/// A lone Esc leaves copy mode. A CSI or SS3 sequence is a cursor or
-/// editing key. Any other escape, like Alt with a key, is ignored.
+/// A CSI or SS3 sequence is a cursor or editing key. Any other ESC is
+/// the Esc key, which leaves copy mode.
 fn decodeEscape(input: []const u8) Key {
-    if (input.len == 1) return .{ .action = .exit, .len = 1 };
+    const esc: Key = .{ .action = .exit, .len = 1 };
+    if (input.len == 1) return esc;
     const introducer = input[1];
-    if (introducer != '[' and introducer != 'O') return .{ .action = null, .len = 2 };
+    if (introducer != '[' and introducer != 'O') return esc;
 
     // Parameter bytes run up to the final byte, 0x40 to 0x7e (ECMA-48
-    // section 5.4). A sequence cut off by the end of the read is
+    // section 5.4). A sequence cut off by the end of the input, which
+    // the key parser passes on only when the rest never came, is
     // dropped whole.
     var end: usize = 2;
     while (end < input.len and (input[end] < 0x40 or input[end] > 0x7e)) end += 1;
@@ -124,8 +126,8 @@ test "cursor and editing keys decode in CSI and SS3 forms" {
     });
 }
 
-test "a lone Esc exits, but Alt with a key and unknown sequences do not" {
-    try expectKeys("\x1bx\x1b[2~\x1b", &.{ null, null, .exit });
+test "Esc exits on its own, even with another key after it, but unknown sequences do not" {
+    try expectKeys("\x1b[2~\x1bx\x1b\x1b", &.{ null, .exit, null, .exit, .exit });
 }
 
 test "a sequence cut off by the end of the read is dropped" {
