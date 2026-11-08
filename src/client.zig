@@ -540,7 +540,8 @@ pub fn control(
             var fds = [_]posix.pollfd{
                 .{ .fd = sock, .events = posix.POLL.IN, .revents = 0 },
             };
-            const ready = posix.poll(&fds, @intCast(dl - now)) catch return error.Timeout;
+            const poll_ms: i32 = @intCast(@min(dl - now, std.math.maxInt(i32)));
+            const ready = posix.poll(&fds, poll_ms) catch return error.Timeout;
             if (ready == 0) return error.Timeout;
         }
         const n = posix.read(sock, &buf) catch 0;

@@ -798,7 +798,8 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer alloc.free(dir);
     try requireSession(alloc, dir, name);
 
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    // Saturate, so a timeout too long to ever expire waits forever.
+    const deadline = std.time.milliTimestamp() +| std.math.lossyCast(i64, timeout_ms);
     while (true) {
         // Every call stops at the deadline, so a daemon that has stopped
         // answering cannot hold the wait past it.

@@ -1851,6 +1851,8 @@ test "agent loop: new, send, wait, peek, kill" {
     try h.startDetached("agent", &.{"sh"});
     try h.sendLine("agent", "echo result-$((40+2))");
     try h.runOk(&.{ "wait", "agent", "--text", "result-42", "--timeout", "10s" });
+    // A timeout too long to represent as a deadline still works.
+    try h.runOk(&.{ "wait", "agent", "--text", "result-42", "--timeout", "107000000000d" });
     try h.runOk(&.{ "wait", "agent", "--idle", "--timeout=10s" });
 
     const content = try h.waitPeekContains("agent", "result-42");
