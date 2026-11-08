@@ -1956,6 +1956,52 @@ test "an attach size past the limit is capped, not applied" {
     try std.testing.expect(parsed.value.object.get("cols").?.integer < 0xffff);
 }
 
+test "a daemon out of descriptors backs off instead of spinning on accept" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A daemon limited to 32 descriptors, logging each failed accept.
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_abs = try std.fs.cwd().realpath(exe_path, &exe_buf);
+    const script = try std.fmt.allocPrint(alloc, "ulimit -n 32 && exec {s} new fdx -d -- cat", .{exe_abs});
+    defer alloc.free(script);
+    const log_path = try std.fmt.allocPrint(alloc, "{s}/daemon.log", .{h.dir});
+    defer alloc.free(log_path);
+    var env = try std.process.getEnvMap(alloc);
+    defer env.deinit();
+    try env.put("BOO_DIR", h.dir);
+    try env.put("BOO_LOG", log_path);
+    const started = try std.process.Child.run(.{ .allocator = alloc, .argv = &.{ "sh", "-c", script }, .env_map = &env });
+    alloc.free(started.stdout);
+    alloc.free(started.stderr);
+    try std.testing.expect(started.term == .Exited and started.term.Exited == 0);
+    try h.waitSessionUp("fdx");
+
+    // Hold more connections than the daemon has descriptors for.
+    var addr: posix.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
+    @memset(&addr.path, 0);
+    _ = try std.fmt.bufPrint(&addr.path, "{s}/fdx.sock", .{h.dir});
+    var conns: [48]posix.fd_t = undefined;
+    var held: usize = 0;
+    defer for (conns[0..held]) |fd| posix.close(fd);
+    while (held < conns.len) : (held += 1) {
+        conns[held] = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+        posix.connect(conns[held], @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+            posix.close(conns[held]);
+            return err;
+        };
+    }
+    std.Thread.sleep(1000 * std.time.ns_per_ms);
+
+    // A spinning daemon logs a failed accept thousands of times a second.
+    const log = try readSmall(alloc, log_path, 1 << 20);
+    defer alloc.free(log);
+    const failures = std.mem.count(u8, log, "accept failed");
+    try std.testing.expect(failures > 0);
+    try std.testing.expect(failures < 50);
+}
+
 /// Stand in for a live daemon that refuses connections, as one does
 /// between bind and listen or with a full backlog. Holds the session's
 /// lock (see src/claim.zig) and binds its socket without listening.

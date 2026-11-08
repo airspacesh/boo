@@ -50,6 +50,11 @@ const max_conn_out: usize = 8 * 1024 * 1024;
 /// columns, and 65535 by 65535 wedges the daemon for minutes.
 pub const max_dimension: u16 = 4096;
 
+/// How long the daemon stops accepting after accept fails, as it does
+/// with every descriptor in use. The failed connection stays in the
+/// backlog, so accepting again at once would spin.
+const accept_backoff_ms: i64 = 100;
+
 /// Upper bound on how long teardown waits for queued finals to drain.
 const shutdown_drain_ms: i64 = 250;
 
@@ -153,6 +158,11 @@ const Conn = struct {
     }
 };
 
+fn monotonicMs() i64 {
+    const ts = posix.clock_gettime(.MONOTONIC) catch unreachable;
+    return ts.sec * std.time.ms_per_s + @divTrunc(ts.nsec, std.time.ns_per_ms);
+}
+
 var sigchld_pipe: posix.fd_t = -1;
 
 fn handleSigchld(_: c_int) callconv(.c) void {
@@ -200,6 +210,10 @@ pub const Daemon = struct {
 
     sig_read: posix.fd_t = -1,
     quitting: bool = false,
+
+    /// Monotonic time (milliseconds) before which the loop does not
+    /// accept, after accept failed.
+    accept_resume_ms: i64 = 0,
 
     /// Serve the session until it ends, then release `claim`.
     pub fn run(alloc: std.mem.Allocator, claim: claimpkg.Claim, opts: Options) !void {
@@ -284,9 +298,11 @@ pub const Daemon = struct {
             fds.clearRetainingCapacity();
             refs.clearRetainingCapacity();
 
-            // poll skips a negative fd, so a retired listener needs no
-            // special case.
-            const listen_fd = if (self.claim) |c| c.listen_fd else -1;
+            // poll skips a negative fd, so a retired or paused listener
+            // needs no special case.
+            const now_ms = monotonicMs();
+            const accepting = now_ms >= self.accept_resume_ms;
+            const listen_fd = if (self.claim != null and accepting) self.claim.?.listen_fd else -1;
             try fds.append(self.alloc, .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 });
             try refs.append(self.alloc, .listen);
             try fds.append(self.alloc, .{ .fd = self.sig_read, .events = posix.POLL.IN, .revents = 0 });
@@ -315,7 +331,17 @@ pub const Daemon = struct {
                 }
             }
 
-            _ = try posix.poll(fds.items, self.heldKeyTimeoutMs());
+            const key_wait_ms = self.heldKeyTimeoutMs();
+            const accept_wait_ms: i32 = if (accepting) -1 else @intCast(self.accept_resume_ms - now_ms);
+            // A wait of -1 has no end, so poll waits for the earlier of
+            // the two that has one.
+            const poll_timeout_ms = if (key_wait_ms < 0)
+                accept_wait_ms
+            else if (accept_wait_ms < 0)
+                key_wait_ms
+            else
+                @min(key_wait_ms, accept_wait_ms);
+            _ = try posix.poll(fds.items, poll_timeout_ms);
 
             for (fds.items, refs.items) |pfd, ref| {
                 if (pfd.revents == 0) continue;
@@ -363,8 +389,10 @@ pub const Daemon = struct {
             // on the Conn and flushed on POLLOUT.
             const fd = posix.accept(listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| switch (err) {
                 error.WouldBlock => return,
+                error.ConnectionAborted => continue,
                 else => {
-                    log.warn("accept failed: {}", .{err});
+                    log.warn("accept failed, pausing for {d} ms: {}", .{ accept_backoff_ms, err });
+                    self.accept_resume_ms = monotonicMs() + accept_backoff_ms;
                     return;
                 },
             };
