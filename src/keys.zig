@@ -16,6 +16,12 @@ const std = @import("std");
 
 pub const escape_byte: u8 = 0x01; // C-a
 
+/// How long held bytes wait for the rest of their key. A key's bytes
+/// normally arrive in one read, but a link like ssh can split them. A
+/// lone ESC that waits this long without more input is the Esc key, the
+/// rule vim's ttimeoutlen and GNU screen's maptimeout apply.
+pub const hold_timeout_ms: u64 = 50;
+
 /// Which keyboard protocols the client's real terminal currently has
 /// active, mirrored from the focused window or view. Gates which
 /// input encodings the parsers decode; everything else is held only
@@ -149,6 +155,11 @@ pub const Parser = struct {
         }
     }
 
+    /// Whether bytes are held, waiting for the rest of their key.
+    pub fn holding(self: *const Parser) bool {
+        return self.held_len > 0;
+    }
+
     /// Whether `byte` keeps the held bytes a viable candidate for an
     /// encoded key this parser may intercept:
     /// `ESC [ <digits...> [;:] ... u` (kitty CSI-u) or
@@ -261,8 +272,10 @@ pub const Parser = struct {
 
     /// Replay held bytes as window input. The first held byte while
     /// pending is consumed as the (unrecognized) command key, exactly
-    /// as it would have been without the hold.
-    fn flushHeld(self: *Parser, handler: anytype) !void {
+    /// as it would have been without the hold. Call it when the held
+    /// bytes have waited `hold_timeout_ms` for more input, so a lone
+    /// ESC resolves to the Esc key.
+    pub fn flushHeld(self: *Parser, handler: anytype) !void {
         const held = self.held[0..self.held_len];
         self.held_len = 0;
         var rest = held;

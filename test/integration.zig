@@ -1496,6 +1496,35 @@ test "modifyOtherKeys apps: encoded C-a still detaches" {
     try std.testing.expectEqual(@as(u32, 0), try second.waitExit());
 }
 
+test "modifyOtherKeys apps: Esc and C-a Esc act without waiting for another key" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Under modifyOtherKeys, like vim's, the parser holds a raw ESC in
+    // case it starts an encoded C-a. The app reads one raw byte and
+    // prints it in hex. The marker follows the mode switches, so the
+    // window has both by the time it is visible.
+    const script = "stty raw -echo; printf '\\033[>4;2mMOK-%s\\r\\n' ON; " ++
+        "head -c 1 | od -An -tx1; exec sleep 60";
+    var client = try PtyClient.spawn(&h, &.{ "new", "mokesc", "--", "sh", "-c", script }, 24, 80);
+    defer client.deinit();
+    try h.waitSessionUp("mokesc");
+    try client.waitFor("MOK-ON");
+
+    // A lone Esc reaches the app once no more input follows it.
+    try client.send("\x1b");
+    const got = try h.waitPeekContains("mokesc", " 1b");
+    alloc.free(got);
+
+    // C-a Esc enters copy mode the same way.
+    client.clearOutput();
+    try client.send("\x01\x1b");
+    const screen = try waitCopyFrame(alloc, &client, 24, 80);
+    defer alloc.free(screen);
+    try std.testing.expect(std.mem.indexOf(u8, screen, "MOK-ON") != null);
+}
+
 test "agent loop: new, send, wait, peek, kill" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

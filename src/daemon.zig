@@ -141,6 +141,9 @@ pub const Daemon = struct {
 
     conns: std.ArrayList(*Conn) = .empty,
     key_parser: keys.Parser = .{},
+    /// Runs from the key parser's latest input, so a key it holds
+    /// resolves once `keys.hold_timeout_ms` pass without more.
+    key_input_timer: std.time.Timer,
 
     /// Owned replacements for opts.name and opts.socket_path after a
     /// rename; the startup values are borrowed from the caller.
@@ -175,6 +178,7 @@ pub const Daemon = struct {
             .rows = opts.rows,
             .cols = opts.cols,
             .last_activity_ms = std.time.milliTimestamp(),
+            .key_input_timer = try std.time.Timer.start(),
         };
         defer self.deinit();
 
@@ -278,7 +282,7 @@ pub const Daemon = struct {
                 }
             }
 
-            _ = try posix.poll(fds.items, -1);
+            _ = try posix.poll(fds.items, self.heldKeyTimeoutMs());
 
             for (fds.items, refs.items) |pfd, ref| {
                 if (pfd.revents == 0) continue;
@@ -299,6 +303,7 @@ pub const Daemon = struct {
                 }
                 if (self.quitting) break;
             }
+            if (self.heldKeyTimeoutMs() == 0) self.resolveHeldKey();
 
             self.sweep();
             if (self.liveWindow() == null) {
@@ -407,13 +412,7 @@ pub const Daemon = struct {
             .input => {
                 if (!conn.attached) return;
                 self.last_activity_ms = std.time.milliTimestamp();
-                const Handler = struct {
-                    daemon: *Daemon,
-                    conn: *Conn,
-                    pub fn command(h: @This(), cmd: keys.Command) !void {
-                        try h.daemon.handleKeyCommand(h.conn, cmd);
-                    }
-                };
+                self.key_input_timer.reset();
                 // When the window runs the kitty keyboard protocol
                 // or modifyOtherKeys, the client's terminal mirrors
                 // it and sends the prefix key encoded.
@@ -422,7 +421,7 @@ pub const Daemon = struct {
                     .kitty = w.kittyKeysActive(),
                     .modify = w.modifyKeysActive(),
                 } else .{};
-                try self.key_parser.feed(msg.payload, prot, Handler{ .daemon = self, .conn = conn });
+                try self.key_parser.feed(msg.payload, prot, KeyHandler{ .daemon = self, .conn = conn });
             },
 
             .resize => {
@@ -469,6 +468,38 @@ pub const Daemon = struct {
             else
                 self.message(conn, "unknown key: ^A ^{c}", .{byte ^ 0x40}),
         }
+    }
+
+    const KeyHandler = struct {
+        daemon: *Daemon,
+        conn: *Conn,
+
+        pub fn command(h: KeyHandler, cmd: keys.Command) !void {
+            try h.daemon.handleKeyCommand(h.conn, cmd);
+        }
+    };
+
+    /// How long poll may wait before a key the parser holds resolves.
+    /// It is 0 once the key is due, and -1, which waits indefinitely,
+    /// when the parser holds none.
+    fn heldKeyTimeoutMs(self: *Daemon) i32 {
+        if (!self.key_parser.holding()) return -1;
+        const waited_ms = self.key_input_timer.read() / std.time.ns_per_ms;
+        return @intCast(keys.hold_timeout_ms -| waited_ms);
+    }
+
+    /// No more input arrived for the key the parser holds, so its held
+    /// bytes are the whole key.
+    fn resolveHeldKey(self: *Daemon) void {
+        const conn = self.attachedConn() orelse {
+            // The client that sent the bytes has gone.
+            self.key_parser = .{};
+            return;
+        };
+        self.key_parser.flushHeld(KeyHandler{ .daemon = self, .conn = conn }) catch |err| {
+            log.warn("error handling held key: {}", .{err});
+            conn.closed = true;
+        };
     }
 
     fn handleCommand(self: *Daemon, conn: *Conn, payload: []const u8) !void {
