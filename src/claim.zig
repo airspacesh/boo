@@ -5,6 +5,7 @@
 //! live daemon, however slowly a live one answers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 
 const paths = @import("paths.zig");
@@ -51,6 +52,14 @@ pub fn claim(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !?Clai
         return null;
     };
     errdefer unlockFile(lock_fd, lock_path);
+
+    // systemd-tmpfiles deletes files in /tmp that have not been touched
+    // for some days, and holding a lock does not touch one. A live
+    // daemon's socket survives, but without its lock the next stale
+    // sweep would delete the socket too. The age cleanup skips files
+    // with the sticky bit (tmpfiles.d(5), "Age"). Other systems may
+    // refuse the bit on a regular file, so it is set only on Linux.
+    if (builtin.os.tag == .linux) try posix.fchmod(lock_fd, 0o1600);
 
     // A socket left at the path belongs to a daemon that died holding
     // the lock.
@@ -153,4 +162,18 @@ test "a claimed name cannot be claimed again until it is released" {
 
     const second = (try claim(alloc, dir, "s")).?;
     second.release(alloc);
+}
+
+test "a claimed name's lock has the sticky bit, so /tmp age cleanup keeps it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+
+    const held = (try claim(alloc, dir, "s")).?;
+    defer held.release(alloc);
+    const stat = try posix.fstat(held.lock_fd);
+    try std.testing.expect(stat.mode & posix.S.ISVTX != 0);
 }
