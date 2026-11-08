@@ -508,6 +508,27 @@ test "detached session: send and peek round-trip through libghostty" {
     defer alloc.free(content);
 }
 
+test "a cell with hundreds of combining marks does not crash the session" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // 700 combining acute accents (octal \314\201) on one "e" overrun
+    // the grapheme allocator of an unpatched ghostty and kill the daemon.
+    try h.startDetached("marks", &.{
+        "sh",
+        "-c",
+        "printf e; i=0; while [ $i -lt 700 ]; do printf '\\314\\201'; " ++
+            "i=$((i+1)); done; echo; echo AFTER-MARKS; exec cat",
+    });
+    const marked = try h.waitPeekContains("marks", "AFTER-MARKS");
+    defer alloc.free(marked);
+
+    try h.sendLine("marks", "still-alive");
+    const alive = try h.waitPeekContains("marks", "still-alive");
+    defer alloc.free(alive);
+}
+
 test "vt sequences: cursor movement, SGR, and clear are emulated" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
