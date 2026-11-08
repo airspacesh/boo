@@ -1,6 +1,6 @@
 //! Full-tree teardown for a session's process tree.
 //!
-//! `boo kill` must end everything the session started, not just the
+//! `pane kill` must end everything the session started, not just the
 //! shell. The shell is the session's PTY child; it ran setsid(), so it
 //! leads its own session and process group (child_pid == pgid). Signaling
 //! only that pid, or even only its process group, leaves behind

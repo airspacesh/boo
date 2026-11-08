@@ -7,12 +7,12 @@ pub const Entry = struct {
     name: []const u8,
     /// Optional short alias (e.g. `at` for `attach`).
     alias: ?[]const u8 = null,
-    /// Full help text printed by `boo help <name>`.
+    /// Full help text printed by `pane help <name>`.
     body: []const u8,
 };
 
 pub const overview =
-    \\boo: sessions that haunt your terminal
+    \\pane: terminal sessions that keep running when you leave
     \\
     \\A terminal multiplexer in the spirit of GNU screen, built on
     \\libghostty. Sessions keep running when you disconnect; reattach
@@ -20,7 +20,7 @@ pub const overview =
     \\human would see them.
     \\
     \\usage:
-    \\  boo <command> [arguments]
+    \\  pane <command> [arguments]
     \\
     \\commands:
     \\
@@ -42,19 +42,19 @@ pub const overview =
     \\    version                      print the version
     \\    help [page]                  this overview, or detailed help
     \\
-    \\Run 'boo help <command>' for flags and examples, 'boo help keys'
-    \\for the key bindings inside a session, 'boo help automation' for
-    \\driving boo from scripts, or 'boo help --all' for every page.
+    \\Run 'pane help <command>' for flags and examples, 'pane help keys'
+    \\for the key bindings inside a session, 'pane help automation' for
+    \\driving pane from scripts, or 'pane help --all' for every page.
     \\
     \\session selection:
     \\  attach accepts a unique prefix of the session name (e.g.
-    \\  'boo attach bu' for "build"). Other commands take the exact
+    \\  'pane attach bu' for "build"). Other commands take the exact
     \\  name.
     \\
     \\environment:
-    \\  BOO_DIR  socket directory
-    \\           (default: /tmp/boo-<uid>)
-    \\  BOO_LOG  append daemon logs to this file (debugging)
+    \\  PANE_DIR  socket directory
+    \\           (default: /tmp/pane-<uid>)
+    \\  PANE_LOG  append daemon logs to this file (debugging)
     \\
 ;
 
@@ -62,7 +62,7 @@ pub const commands = [_]Entry{
     .{
         .name = "new",
         .body =
-        \\usage: boo new [name] [-d|--detached] [--rows N] [--cols N] [-- cmd...]
+        \\usage: pane new [name] [-d|--detached] [--rows N] [--cols N] [-- cmd...]
         \\
         \\Start a session running cmd (default: $SHELL) and attach to
         \\it. The session keeps running after you detach (C-a d) or
@@ -85,9 +85,9 @@ pub const commands = [_]Entry{
         \\                  current directory (must already exist)
         \\
         \\examples:
-        \\  boo new                      interactive shell, attach now
-        \\  boo new work                 named session
-        \\  boo new build -d -- make -j  background a build
+        \\  pane new                      interactive shell, attach now
+        \\  pane new work                 named session
+        \\  pane new build -d -- make -j  background a build
         \\
         ,
     },
@@ -95,9 +95,9 @@ pub const commands = [_]Entry{
         .name = "attach",
         .alias = "at",
         .body =
-        \\usage: boo attach <name>
-        \\       boo at <name>
-        \\       boo a <name>
+        \\usage: pane attach <name>
+        \\       pane at <name>
+        \\       pane a <name>
         \\
         \\Attach this terminal to a session. The screen, scrollback,
         \\cursor, and title are restored from terminal state. If the
@@ -107,12 +107,12 @@ pub const commands = [_]Entry{
         \\
         \\A unique prefix of the name is accepted.
         \\
-        \\Inside the session, press C-a d to detach. See 'boo help
+        \\Inside the session, press C-a d to detach. See 'pane help
         \\keys' for all bindings.
         \\
         \\examples:
-        \\  boo attach build     reattach "build"
-        \\  boo at bu            the same, by prefix
+        \\  pane attach build     reattach "build"
+        \\  pane at bu            the same, by prefix
         \\
         ,
     },
@@ -120,7 +120,7 @@ pub const commands = [_]Entry{
         .name = "ls",
         .alias = "list",
         .body =
-        \\usage: boo ls [--json]
+        \\usage: pane ls [--json]
         \\
         \\List sessions: name, attach state, idle time (time since the
         \\last output or client input), and the session's title. A
@@ -141,7 +141,7 @@ pub const commands = [_]Entry{
     .{
         .name = "send",
         .body =
-        \\usage: boo send <name> [--text <text>] [--key <list>] [flags]
+        \\usage: pane send <name> [--text <text>] [--key <list>] [flags]
         \\
         \\Type into a session, exactly as if the text had been typed
         \\at the keyboard. --text is sent literally: no escape
@@ -159,16 +159,16 @@ pub const commands = [_]Entry{
         \\  --stdin        force reading from stdin
         \\
         \\examples:
-        \\  boo send build --text 'make test' --enter   run a command
-        \\  boo send build --key C-c                    interrupt it
-        \\  printf 'y\n' | boo send build               pipe bytes in
+        \\  pane send build --text 'make test' --enter   run a command
+        \\  pane send build --key C-c                    interrupt it
+        \\  printf 'y\n' | pane send build               pipe bytes in
         \\
         ,
     },
     .{
         .name = "peek",
         .body =
-        \\usage: boo peek <name> [--scrollback] [--json]
+        \\usage: pane peek <name> [--scrollback] [--json]
         \\
         \\Print the session's rendered screen: what a human attached
         \\right now would see, reconstructed from terminal state (not
@@ -180,15 +180,15 @@ pub const commands = [_]Entry{
         \\                "cursor":{"row","col"},"screen"}
         \\
         \\examples:
-        \\  boo peek build | tail -20
-        \\  boo peek build --scrollback | grep -n error
+        \\  pane peek build | tail -20
+        \\  pane peek build --scrollback | grep -n error
         \\
         ,
     },
     .{
         .name = "wait",
         .body =
-        \\usage: boo wait <name> (--text <text> | --idle) [--timeout <dur>]
+        \\usage: pane wait <name> (--text <text> | --idle) [--timeout <dur>]
         \\
         \\Block until something happens in the session, then exit 0.
         \\Replaces sleep-and-poll loops in scripts.
@@ -204,55 +204,55 @@ pub const commands = [_]Entry{
         \\(or 4hr), 1d. Flags also accept --flag=value.
         \\
         \\examples:
-        \\  boo wait build --text 'PASS' --timeout 2m
-        \\  boo wait build --idle && boo peek build
+        \\  pane wait build --text 'PASS' --timeout 2m
+        \\  pane wait build --idle && pane peek build
         \\
         ,
     },
     .{
         .name = "kill",
         .body =
-        \\usage: boo kill <name | --all>
+        \\usage: pane kill <name | --all>
         \\
         \\End a session: its process receives SIGHUP and the daemon
         \\exits. --all ends every session and sweeps stale sockets.
         \\
         \\examples:
-        \\  boo kill build
-        \\  boo kill --all
+        \\  pane kill build
+        \\  pane kill --all
         \\
         ,
     },
     .{
         .name = "rename",
         .body =
-        \\usage: boo rename <name> <new-name>
+        \\usage: pane rename <name> <new-name>
         \\
         \\Rename a session. The running program is unaffected and an
         \\attached client stays attached.
         \\
         \\example:
-        \\  boo rename work api-server
+        \\  pane rename work api-server
         \\
         ,
     },
     .{
         .name = "version",
         .body =
-        \\usage: boo version
+        \\usage: pane version
         \\
-        \\Print the boo version. Also available as -V or --version.
+        \\Print the pane version. Also available as -V or --version.
         \\
         ,
     },
     .{
         .name = "help",
         .body =
-        \\usage: boo help [page] [--all]
+        \\usage: pane help [page] [--all]
         \\
         \\Show the overview or a detailed page. There is a page for
         \\every command, plus 'keys' (the C-a bindings inside a
-        \\session) and 'automation' (driving boo from scripts and AI
+        \\session) and 'automation' (driving pane from scripts and AI
         \\agents). --all prints every page in one pass, which is handy
         \\for piping into a pager or for tools that want to learn the
         \\whole CLI in one call.
@@ -274,7 +274,7 @@ pub const topics = [_]Entry{
         \\
         \\Control variants match GNU screen: C-a C-d detaches and
         \\C-a C-l redraws. Detaching leaves the session running;
-        \\'boo attach' brings it back.
+        \\'pane attach' brings it back.
         \\
         \\Copy mode keys
         \\
@@ -296,16 +296,16 @@ pub const topics = [_]Entry{
     .{
         .name = "automation",
         .body =
-        \\Driving boo from scripts and AI agents
+        \\Driving pane from scripts and AI agents
         \\
         \\Everything except 'attach' works without a terminal. The
         \\canonical loop:
         \\
-        \\  boo new build -d -- bash               # 1. headless session
-        \\  boo send build --text 'make' --enter   # 2. type into it
-        \\  boo wait build --idle                  # 3. let output settle
-        \\  boo peek build --scrollback            # 4. read the screen
-        \\  boo kill build                         # 5. clean up
+        \\  pane new build -d -- bash               # 1. headless session
+        \\  pane send build --text 'make' --enter   # 2. type into it
+        \\  pane wait build --idle                  # 3. let output settle
+        \\  pane peek build --scrollback            # 4. read the screen
+        \\  pane kill build                         # 5. clean up
         \\
         \\reading state:
         \\  peek prints the rendered screen, not a raw byte stream:
@@ -313,9 +313,9 @@ pub const topics = [_]Entry{
         \\  history; --json adds size, cursor, and title.
         \\
         \\waiting (instead of sleep):
-        \\  boo wait <name> --text <text>   screen contains <text>
-        \\  boo wait <name> --idle          output quiet for 2 seconds
-        \\  boo wait <name> ... --timeout <dur>   exit 4 on timeout
+        \\  pane wait <name> --text <text>   screen contains <text>
+        \\  pane wait <name> --idle          output quiet for 2 seconds
+        \\  pane wait <name> ... --timeout <dur>   exit 4 on timeout
         \\
         \\sending input:
         \\  send is literal: no escapes, no implicit newline, no
@@ -323,9 +323,9 @@ pub const topics = [_]Entry{
         \\  control keys; stdin mode is binary safe.
         \\
         \\machine-readable output:
-        \\  boo ls --json    [{"name","responding","attached","idle_ms",
+        \\  pane ls --json    [{"name","responding","attached","idle_ms",
         \\                    "unread","bell_idle_ms","pid","title"}]
-        \\  boo peek --json  {"session","title","rows","cols",
+        \\  pane peek --json  {"session","title","rows","cols",
         \\                    "cursor":{"row","col"},"screen"}
         \\
         \\exit codes:
@@ -334,7 +334,7 @@ pub const topics = [_]Entry{
         \\
         \\tips:
         \\  - Sessions are cheap; use one session per task.
-        \\  - 'boo new -d' prints the session name on stdout.
+        \\  - 'pane new -d' prints the session name on stdout.
         \\
         ,
     },

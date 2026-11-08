@@ -1,5 +1,5 @@
-//! boo: sessions that haunt your terminal. A GNU screen style
-//! terminal multiplexer built on libghostty (ghostty-vt).
+//! pane: terminal sessions that keep running when you leave. A GNU
+//! screen style terminal multiplexer built on libghostty (ghostty-vt).
 
 const std = @import("std");
 const posix = std.posix;
@@ -11,23 +11,23 @@ const help = @import("help.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 
-pub const version = "0.6.4";
+pub const version = "0.7.0";
 
-/// Exit codes, documented in `boo help`.
+/// Exit codes, documented in `pane help`.
 const exit_runtime: u8 = 1;
 const exit_usage: u8 = 2;
 const exit_no_session: u8 = 3;
 const exit_timeout: u8 = 4;
 
 fn fail(code: u8, comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print("boo: " ++ fmt ++ "\n", args);
+    std.debug.print("pane: " ++ fmt ++ "\n", args);
     posix.exit(code);
 }
 
 /// Usage errors point at the relevant help page.
 fn usageFail(comptime cmd: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
-    const hint = if (cmd.len == 0) "boo help" else "boo help " ++ cmd;
-    std.debug.print("boo: " ++ fmt ++ " (run '" ++ hint ++ "')\n", args);
+    const hint = if (cmd.len == 0) "pane help" else "pane help " ++ cmd;
+    std.debug.print("pane: " ++ fmt ++ " (run '" ++ hint ++ "')\n", args);
     posix.exit(exit_usage);
 }
 
@@ -73,7 +73,7 @@ pub fn main() !void {
     if (eql(cmd, "rename")) return cmdRename(alloc, rest);
     if (eql(cmd, "version") or eql(cmd, "-V") or eql(cmd, "--version")) return cmdVersion(alloc);
     if (eql(cmd, "help") or eql(cmd, "-h") or eql(cmd, "--help")) return cmdHelp(alloc, rest);
-    fail(exit_usage, "unknown command '{s}' (run 'boo help')", .{cmd});
+    fail(exit_usage, "unknown command '{s}' (run 'pane help')", .{cmd});
 }
 
 fn isHelpFlag(arg: []const u8) bool {
@@ -101,7 +101,7 @@ fn flagValue(
     return null;
 }
 
-/// Parse a positive terminal dimension (rows or cols) for `boo new`.
+/// Parse a positive terminal dimension (rows or cols) for `pane new`.
 fn parseDimension(comptime flag: []const u8, value: []const u8) u16 {
     const max = daemonpkg.max_dimension;
     const n = std.fmt.parseInt(u16, value, 10) catch 0;
@@ -116,12 +116,12 @@ fn socketDir(alloc: std.mem.Allocator) ![]u8 {
     paths.ensurePrivateDir(dir) catch |err| switch (err) {
         error.NotDir => fail(
             exit_runtime,
-            "socket directory {s} is not a directory (set BOO_DIR to a directory of your own)",
+            "socket directory {s} is not a directory (set PANE_DIR to a directory of your own)",
             .{dir},
         ),
         error.NotOwned => fail(
             exit_runtime,
-            "socket directory {s} belongs to another user (set BOO_DIR to a directory of your own)",
+            "socket directory {s} belongs to another user (set PANE_DIR to a directory of your own)",
             .{dir},
         ),
         error.OpenToOthers => fail(
@@ -176,7 +176,7 @@ fn resolvePrefix(
     if (matches.items.len > 1) fail(exit_no_session, "ambiguous session '{s}': matches {s}", .{
         want, joinNames(alloc, matches.items),
     });
-    fail(exit_no_session, "no session matching '{s}' (run 'boo ls')", .{want});
+    fail(exit_no_session, "no session matching '{s}' (run 'pane ls')", .{want});
 }
 
 /// Exit with a message when the socket for `name` in `dir` is too long
@@ -187,7 +187,7 @@ fn requireSocketPathFits(alloc: std.mem.Allocator, dir: []const u8, name: []cons
     if (sock.len <= paths.max_socket_path_len) return;
     fail(
         exit_runtime,
-        "socket path {s} is {d} bytes, over the {d} a Unix socket allows (use a shorter name or set BOO_DIR to a shorter directory)",
+        "socket path {s} is {d} bytes, over the {d} a Unix socket allows (use a shorter name or set PANE_DIR to a shorter directory)",
         .{ sock, sock.len, paths.max_socket_path_len },
     );
 }
@@ -196,11 +196,11 @@ fn requireSocketPathFits(alloc: std.mem.Allocator, dir: []const u8, name: []cons
 /// every command but attach requires. Exits with code 3 otherwise.
 fn requireSession(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
     paths.validateName(name) catch
-        fail(exit_no_session, "no session named {s} (run 'boo ls')", .{name});
+        fail(exit_no_session, "no session named {s} (run 'pane ls')", .{name});
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
     std.fs.cwd().access(sock, .{}) catch
-        fail(exit_no_session, "no session named {s} (run 'boo ls')", .{name});
+        fail(exit_no_session, "no session named {s} (run 'pane ls')", .{name});
 }
 
 pub const SessionInfo = struct {
@@ -388,15 +388,15 @@ fn createSession(
     try requireSocketPathFits(alloc, dir, name);
     const session = try claimpkg.claim(alloc, dir, name) orelse fail(
         exit_runtime,
-        "session {s} already exists (run 'boo attach {s}')",
+        "session {s} already exists (run 'pane attach {s}')",
         .{ name, name },
     );
 
     // Fork the session daemon. The listening socket already exists, so
     // there is no race between daemon startup and the first attach.
-    // BOO_FOREGROUND=1 keeps the daemon in the foreground, which is
+    // PANE_FOREGROUND=1 keeps the daemon in the foreground, which is
     // useful for debugging.
-    if (posix.getenv("BOO_FOREGROUND") != null) {
+    if (posix.getenv("PANE_FOREGROUND") != null) {
         var opts: daemonpkg.Options = .{
             .name = name,
             .argv = cmd_argv,
@@ -942,7 +942,7 @@ fn cmdRename(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 }
 
 fn cmdVersion(alloc: std.mem.Allocator) !void {
-    try stdoutPrint(alloc, "boo {s}\n", .{version});
+    try stdoutPrint(alloc, "pane {s}\n", .{version});
 }
 
 fn cmdHelp(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -1036,13 +1036,13 @@ fn fmtIdle(buf: []u8, ms: i64) []const u8 {
 
 // -- Daemon plumbing ------------------------------------------------------
 
-/// Open the destination for std.log and std.debug output: $BOO_LOG
+/// Open the destination for std.log and std.debug output: $PANE_LOG
 /// (created, appended) when set, otherwise /dev/null. The session daemon
 /// is forked from a command whose stderr is the user's terminal, where
 /// libghostty's in-process VT logging would paint over the display, so
 /// it routes stderr here. Returns null when the target cannot be opened.
 fn openLogSink() ?posix.fd_t {
-    if (posix.getenv("BOO_LOG")) |log_path| {
+    if (posix.getenv("PANE_LOG")) |log_path| {
         return posix.open(log_path, .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
@@ -1065,7 +1065,7 @@ fn runDaemon(
     _ = posix.setsid() catch {};
 
     // Detach stdio: stdin and stdout go to /dev/null, stderr to the log
-    // sink (BOO_LOG when set, else /dev/null) so std.log output is
+    // sink (PANE_LOG when set, else /dev/null) so std.log output is
     // preserved for debugging.
     const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch posix.exit(1);
     posix.dup2(devnull, 0) catch {};

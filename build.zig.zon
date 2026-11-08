@@ -1,7 +1,7 @@
 .{
-    .name = .boo,
-    .version = "0.6.4",
-    .fingerprint = 0x8b7acdfd255f0e34,
+    .name = .pane,
+    .version = "0.7.0",
+    .fingerprint = 0xc5c80d69b113bfdb,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .ghostty = .{

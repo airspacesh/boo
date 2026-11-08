@@ -2,8 +2,8 @@
 //! output stream.
 //!
 //! Applications detect the terminal's light/dark theme by querying the
-//! background color with OSC 11 (`ESC ] 11 ; ? BEL`). Inside a boo
-//! session the real terminal is not reachable: a `boo attach` strips the
+//! background color with OSC 11 (`ESC ] 11 ; ? BEL`). Inside a pane
+//! session the real terminal is not reachable: a `pane attach` strips the
 //! query along with the alternate-screen tail it rides behind. The
 //! daemon therefore answers these queries itself from the background a
 //! client reported (see `window.zig`).

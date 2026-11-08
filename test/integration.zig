@@ -1,4 +1,4 @@
-//! End-to-end tests that drive the real boo binary through a real
+//! End-to-end tests that drive the real pane binary through a real
 //! PTY: a test "terminal" (PTY master) hosts the attach client as
 //! its controlling terminal, exactly like a user's terminal would.
 //! Detached control flows go through the public subcommand CLI.
@@ -57,9 +57,9 @@ const Harness = struct {
         std.crypto.random.bytes(&random_bytes);
         var suffix: [12]u8 = undefined;
         const hex = std.fmt.bufPrint(&suffix, "{x}", .{&random_bytes}) catch unreachable;
-        const dir = try std.fmt.allocPrint(alloc, "/tmp/bootest-{s}", .{hex});
+        const dir = try std.fmt.allocPrint(alloc, "/tmp/panetest-{s}", .{hex});
         errdefer alloc.free(dir);
-        // boo refuses a socket directory that other users can reach.
+        // pane refuses a socket directory that other users can reach.
         try posix.mkdir(dir, 0o700);
         return .{ .alloc = alloc, .dir = dir };
     }
@@ -98,7 +98,7 @@ const Harness = struct {
 
         var env = try std.process.getEnvMap(self.alloc);
         defer env.deinit();
-        try env.put("BOO_DIR", self.dir);
+        try env.put("PANE_DIR", self.dir);
 
         var child = std.process.Child.init(full_argv.items, self.alloc);
         child.cwd = cwd;
@@ -133,7 +133,7 @@ const Harness = struct {
         defer self.alloc.free(result.stdout);
         defer self.alloc.free(result.stderr);
         if (result.term != .Exited or result.term.Exited != 0) {
-            std.debug.print("boo {s} failed: {s}\n", .{ argv[0], result.stderr });
+            std.debug.print("pane {s} failed: {s}\n", .{ argv[0], result.stderr });
             return error.CommandFailed;
         }
     }
@@ -145,7 +145,7 @@ const Harness = struct {
         defer self.alloc.free(result.stderr);
         if (result.term != .Exited or result.term.Exited != want) {
             std.debug.print(
-                "boo {s}: wanted exit {d}, got {any}: {s}\n",
+                "pane {s}: wanted exit {d}, got {any}: {s}\n",
                 .{ argv[0], want, result.term, result.stderr },
             );
             return error.WrongExit;
@@ -257,7 +257,7 @@ const Harness = struct {
     }
 };
 
-/// The "unread" flag for `session` in a `boo ls --json` array, or null
+/// The "unread" flag for `session` in a `pane ls --json` array, or null
 /// when the session or field is absent or the JSON does not parse.
 fn jsonUnread(alloc: std.mem.Allocator, json: []const u8, session: []const u8) ?bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return null;
@@ -284,7 +284,7 @@ fn jsonUnread(alloc: std.mem.Allocator, json: []const u8, session: []const u8) ?
     return null;
 }
 
-/// The "bell_idle_ms" value for `session` in a `boo ls --json` array, or
+/// The "bell_idle_ms" value for `session` in a `pane ls --json` array, or
 /// null when the session or field is absent or the JSON does not parse.
 fn jsonBellIdle(alloc: std.mem.Allocator, json: []const u8, session: []const u8) ?i64 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return null;
@@ -331,7 +331,7 @@ const Deadline = struct {
     }
 };
 
-/// A boo client process running on a real PTY owned by the test.
+/// A pane client process running on a real PTY owned by the test.
 const PtyClient = struct {
     alloc: std.mem.Allocator,
     master: posix.fd_t,
@@ -348,7 +348,7 @@ const PtyClient = struct {
         return spawnProgram(harness, exe_path, argv, rows, cols, &.{});
     }
 
-    /// Like spawn, but runs an arbitrary program instead of the boo
+    /// Like spawn, but runs an arbitrary program instead of the pane
     /// binary, e.g. a shell wrapping an attach the way a login shell
     /// does for a user. `env_extra` overrides or adds environment
     /// variables for the child.
@@ -400,7 +400,7 @@ const PtyClient = struct {
         for (argv, 1..) |arg, i| argv_z[i] = try arena.dupeZ(u8, arg);
 
         var env = try std.process.getEnvMap(arena);
-        try env.put("BOO_DIR", harness.dir);
+        try env.put("PANE_DIR", harness.dir);
         for (env_extra) |pair| try env.put(pair[0], pair[1]);
         const envp = try std.process.createEnvironFromMap(arena, &env, .{});
 
@@ -991,7 +991,7 @@ test "auto-repeated C-a stays armed until the command key" {
 /// key keeps auto-repeating until the restored screen is visible, and
 /// one final repeat lands after the client has already restored. The
 /// attach runs under a wrapping shell on the same tty (a login shell
-/// stand-in) whose `read` exposes any input that boo leaks: leaked
+/// stand-in) whose `read` exposes any input that pane leaks: leaked
 /// repeats corrupt the typed probe line, and a leaked C-d (EOF) ends
 /// the read prematurely, which is the SSH-session-killer variant.
 fn expectNoDetachKeyLeak(
@@ -1366,7 +1366,7 @@ test "help: overview, command pages, topics, and version" {
     const ver = try h.run(&.{"version"});
     defer alloc.free(ver.stdout);
     defer alloc.free(ver.stderr);
-    try std.testing.expect(std.mem.startsWith(u8, ver.stdout, "boo "));
+    try std.testing.expect(std.mem.startsWith(u8, ver.stdout, "pane "));
 }
 
 test "ls emits machine-readable JSON" {
@@ -1501,7 +1501,7 @@ test "wait --text and --idle observe session output" {
     try h.runExit(&.{ "wait", "w1", "--text", "NEVER-APPEARS", "--timeout", "300ms" }, 4);
 }
 
-test "zero-arg boo prints the help overview" {
+test "zero-arg pane prints the help overview" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
@@ -2004,8 +2004,8 @@ test "a daemon out of descriptors backs off instead of spinning on accept" {
     defer alloc.free(log_path);
     var env = try std.process.getEnvMap(alloc);
     defer env.deinit();
-    try env.put("BOO_DIR", h.dir);
-    try env.put("BOO_LOG", log_path);
+    try env.put("PANE_DIR", h.dir);
+    try env.put("PANE_LOG", log_path);
     const started = try std.process.Child.run(.{ .allocator = alloc, .argv = &.{ "sh", "-c", script }, .env_map = &env });
     alloc.free(started.stdout);
     alloc.free(started.stderr);

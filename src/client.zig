@@ -640,7 +640,7 @@ test "control times out when the daemon never answers" {
     var name_buf: [64]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &name_buf,
-        "/tmp/boo-control-timeout-{x}.sock",
+        "/tmp/pane-control-timeout-{x}.sock",
         .{std.crypto.random.int(u32)},
     );
     std.fs.cwd().deleteFile(path) catch {};
@@ -648,7 +648,7 @@ test "control times out when the daemon never answers" {
     // A listener that never accepts: connect() still succeeds via the
     // backlog and the command write is buffered, so the reply read is
     // what blocks. Without the timeout this call would hang forever
-    // (the boo ls freeze); with it, it must give up.
+    // (the pane ls freeze); with it, it must give up.
     const lfd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
     defer {
         posix.close(lfd);

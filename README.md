@@ -1,29 +1,20 @@
-<div align="center">
-<pre>
- _                     .-.
- | |__   ___   ___     (o o)
- | '_ \ / _ \ / _ \    | O \
-  | |_) | (_) | (_) |    \   \
-   |_.__/ \___/ \___/      `~~~'
-</pre>
+# pane
 
-Sessions that haunt your terminal.
+Terminal sessions that keep running when you leave.
 
-[Install](#install) | [Usage](#usage) | [Automation](#automation) | [Why](#why-boo) | [Architecture](#architecture)
+pane is a fork of [coder/boo](https://github.com/coder/boo), from its
+v0.6.4 release.
 
-[![ci](https://github.com/coder/boo/actions/workflows/ci.yml/badge.svg)](https://github.com/coder/boo/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/coder/boo)](https://github.com/coder/boo/releases/latest)
-[![license](https://img.shields.io/github/license/coder/boo)](./LICENSE)
-[![discord](https://img.shields.io/discord/747933592273027093?label=discord)](https://discord.gg/coder)
+[Install](#install) | [Usage](#usage) | [Automation](#automation) | [Why](#why-pane) | [Architecture](#architecture)
 
-</div>
+[![ci](https://github.com/airspacesh/pane/actions/workflows/ci.yml/badge.svg)](https://github.com/airspacesh/pane/actions/workflows/ci.yml)
 
 A GNU `screen` style terminal multiplexer built on
 [libghostty](https://github.com/ghostty-org/ghostty)
 (`libghostty-vt`), written in Zig.
 
 Every session's output is parsed through Ghostty's terminal emulation
-core, so boo always knows the exact screen state of every session:
+core, so pane always knows the exact screen state of every session:
 contents, styles, cursor, scrollback, and terminal modes. That state is
 used to rehydrate your terminal on attach, to answer terminal queries
 for detached sessions, and to let scripts and AI agents read the screen
@@ -31,45 +22,41 @@ exactly as a human would see it.
 
 ## Features
 
-- Sessions that survive disconnects: detach with `Ctrl-A d`, reattach with `boo attach`.
+- Sessions that survive disconnects: detach with `Ctrl-A d`, reattach with `pane attach`.
 - Faithful redraws from libghostty terminal state, including SGR styles, cursor position, scrolling regions, window title, and terminal modes.
 - Agent-friendly automation primitives: `send`, `peek`, `wait`, and `--json` output, all usable without a TTY.
 
-<video src="https://github.com/user-attachments/assets/d9310edd-68e8-4bc2-aac5-80f1da431dae" autoplay="autoplay" loop muted playsinline></video>
-
 ## Install
 
-For Linux and macOS:
+Build from source with [Zig](https://ziglang.org) 0.15.2, on Linux or
+macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/coder/boo/main/install.sh | sh
+zig build -Doptimize=ReleaseSafe
+cp zig-out/bin/pane ~/.local/bin/
 ```
-
-Pre-built binaries are published on the [releases page](https://github.com/coder/boo/releases). Set `BOO_VERSION` to pin a release and `BOO_INSTALL_DIR` to change the
-install location (default: `/usr/local/bin` when writable, otherwise
-`~/.local/bin`).
 
 ## Usage
 
 ```sh
-boo new                    # new session running $SHELL, attached
-boo new work               # named session
-boo new work -d -- make    # create detached, running a command
-boo ls                     # list sessions
-boo attach work            # reattach (alias: at, a)
-boo rename work api        # rename a session
-boo kill work              # end a session
-boo kill --all             # end every session
+pane new                    # new session running $SHELL, attached
+pane new work               # named session
+pane new work -d -- make    # create detached, running a command
+pane ls                     # list sessions
+pane attach work            # reattach (alias: at, a)
+pane rename work api        # rename a session
+pane kill work              # end a session
+pane kill --all             # end every session
 ```
 
-With no name, `boo new` names the session after the current directory,
+With no name, `pane new` names the session after the current directory,
 falling back to the process id when that name is taken or unusable.
-`attach` accepts a unique prefix of a session's name (`boo at w`), and
+`attach` accepts a unique prefix of a session's name (`pane at w`), and
 every other command takes the exact name, so a script cannot act on the
 wrong session.
 
-Run `boo help` for the full overview, `boo help <command>` for flags
-and examples, and `boo help --all` to print every help page at once.
+Run `pane help` for the full overview, `pane help <command>` for flags
+and examples, and `pane help --all` to print every help page at once.
 
 ### Key bindings (prefix `Ctrl-a`)
 
@@ -90,16 +77,16 @@ screen.
 
 ### Automation
 
-Everything except `attach` works without a terminal, which makes boo a
+Everything except `attach` works without a terminal, which makes pane a
 natural sandbox for scripts and AI agents driving interactive programs.
 The canonical loop:
 
 ```sh
-boo new build -d -- bash               # 1. headless session
-boo send build --text 'make' --enter   # 2. type into it
-boo wait build --idle                  # 3. let output settle
-boo peek build --scrollback            # 4. read the screen
-boo kill build                         # 5. clean up
+pane new build -d -- bash               # 1. headless session
+pane send build --text 'make' --enter   # 2. type into it
+pane wait build --idle                  # 3. let output settle
+pane peek build --scrollback            # 4. read the screen
+pane kill build                         # 5. clean up
 ```
 
 - **Reading state**: `peek` prints the rendered screen reconstructed
@@ -118,15 +105,15 @@ boo kill build                         # 5. clean up
 - **Exit codes**: `0` success, `1` error, `2` usage error, `3` no such
   session, `4` wait timed out.
 
-See `boo help automation` for the full page.
+See `pane help automation` for the full page.
 
-## Why boo?
+## Why pane?
 
-GNU screen works the same way boo does, architecturally: it parses all
+GNU screen works the same way pane does, architecturally: it parses all
 output through its own built-in terminal emulator and redraws from
 that state on reattach. But that emulator is decades old and lags far
 behind what modern programs emit. Whatever it doesn't understand gets
-dropped or mangled on redraw. boo swaps that layer for `libghostty-vt`,
+dropped or mangled on redraw. pane swaps that layer for `libghostty-vt`,
 Ghostty's VT core, so the saved state matches what your terminal would
 actually display, and terminal queries are answered while detached so
 TUIs don't hang unattended.
@@ -135,7 +122,7 @@ Scripting is the other win: `send`, `peek --json`, and
 `wait --text`/`--idle` instead of `-X stuff`, hardcopy files, and
 sleep loops.
 
-tmux is great, it just solves a different problem. boo keeps screen's
+tmux is great, it just solves a different problem. pane keeps screen's
 model by design: sessions, a prefix key, and nothing else to learn.
 One session per task.
 
@@ -144,7 +131,7 @@ One session per task.
 Requires [Zig](https://ziglang.org) 0.15.2.
 
 ```sh
-zig build                       # binary in zig-out/bin/boo
+zig build                       # binary in zig-out/bin/pane
 zig build test                  # unit tests
 zig build test-integration     # end-to-end tests on a real PTY
 zig build test-all             # everything
@@ -153,13 +140,10 @@ zig build test-all             # everything
 The libghostty dependency is fetched and built from source
 automatically (pinned in `build.zig.zon`).
 
-With Nix, `nix develop` opens a shell with the right Zig version, and
-`nix build` builds the package to `./result/bin/boo`.
-
 ## Architecture
 
 ```
-your terminal <-(raw tty)-> boo client <-(unix socket)-> session daemon
+your terminal <-(raw tty)-> pane client <-(unix socket)-> session daemon
                                                          `- PTY + ghostty-vt Terminal
 ```
 
@@ -188,7 +172,7 @@ This is a young project, not a drop-in GNU screen replacement:
 
 ## Support
 
-Feel free to [open an issue](https://github.com/coder/boo/issues/new)
+Feel free to [open an issue](https://github.com/airspacesh/pane/issues/new)
 if you have questions, run into bugs, or have a feature request.
 
 ## License

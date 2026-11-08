@@ -17,21 +17,21 @@ pub fn validateName(name: []const u8) NameError!void {
     if (name[0] == '.' or name[0] == '-') return error.InvalidSessionName;
 }
 
-/// Resolve the directory that holds session sockets: $BOO_DIR, else
-/// /tmp/boo-<uid>. `ensurePrivateDir` makes it ready for use.
+/// Resolve the directory that holds session sockets: $PANE_DIR, else
+/// /tmp/pane-<uid>. `ensurePrivateDir` makes it ready for use.
 pub fn socketDir(alloc: std.mem.Allocator) ![]u8 {
-    return socketDirFrom(alloc, std.posix.getenv("BOO_DIR"));
+    return socketDirFrom(alloc, std.posix.getenv("PANE_DIR"));
 }
 
 /// Sessions outlive the login that started them, so they cannot live in
 /// $XDG_RUNTIME_DIR. systemd-logind deletes that directory when the
 /// user's last login ends, which would leave every detached session
 /// running but unreachable.
-fn socketDirFrom(alloc: std.mem.Allocator, boo_dir: ?[]const u8) ![]u8 {
-    if (boo_dir) |d| {
+fn socketDirFrom(alloc: std.mem.Allocator, pane_dir: ?[]const u8) ![]u8 {
+    if (pane_dir) |d| {
         if (d.len > 0) return alloc.dupe(u8, d);
     }
-    return std.fmt.allocPrint(alloc, "/tmp/boo-{d}", .{std.c.getuid()});
+    return std.fmt.allocPrint(alloc, "/tmp/pane-{d}", .{std.c.getuid()});
 }
 
 /// Check that `dir` is a directory only this user can reach, creating it
@@ -182,16 +182,16 @@ test "socketPath" {
     try std.testing.expectEqualStrings("/run/gs/work.sock", p);
 }
 
-test "socketDirFrom prefers BOO_DIR" {
+test "socketDirFrom prefers PANE_DIR" {
     const alloc = std.testing.allocator;
-    const dir = try socketDirFrom(alloc, "/somewhere/boo");
+    const dir = try socketDirFrom(alloc, "/somewhere/pane");
     defer alloc.free(dir);
-    try std.testing.expectEqualStrings("/somewhere/boo", dir);
+    try std.testing.expectEqualStrings("/somewhere/pane", dir);
 }
 
-test "socketDirFrom defaults to /tmp/boo-<uid>" {
+test "socketDirFrom defaults to /tmp/pane-<uid>" {
     const alloc = std.testing.allocator;
-    const want = try std.fmt.allocPrint(alloc, "/tmp/boo-{d}", .{std.c.getuid()});
+    const want = try std.fmt.allocPrint(alloc, "/tmp/pane-{d}", .{std.c.getuid()});
     defer alloc.free(want);
 
     const dir = try socketDirFrom(alloc, null);

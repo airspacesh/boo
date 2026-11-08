@@ -129,7 +129,7 @@ fn listen(path: []const u8) !posix.fd_t {
     @memcpy(addr.path[0..path.len], path);
     // bind creates the socket file with the umask's permissions, which
     // may let the group connect, and chmod on a socket fails on some
-    // file systems. The umask is process-wide, but boo is
+    // file systems. The umask is process-wide, but pane is
     // single-threaded, so nothing else creates a file meanwhile.
     const umask = std.c.umask(0o177);
     defer _ = std.c.umask(umask);

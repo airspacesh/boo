@@ -876,7 +876,7 @@ pub const Daemon = struct {
         var env = try std.process.getEnvMap(alloc);
         defer env.deinit();
         try env.put("TERM", "xterm-256color");
-        try env.put("BOO", session_name);
+        try env.put("PANE", session_name);
 
         var default_argv: [1][]const u8 = .{env.get("SHELL") orelse "/bin/sh"};
         const child_argv: []const []const u8 = if (argv.len > 0) argv else &default_argv;
