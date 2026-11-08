@@ -8,6 +8,7 @@ const protocol = @import("protocol.zig");
 const ptypkg = @import("pty.zig");
 const window = @import("window.zig");
 const keys = @import("keys.zig");
+const paths = @import("paths.zig");
 
 const log = std.log.scoped(.client);
 
@@ -67,13 +68,39 @@ pub fn connect(alloc: std.mem.Allocator, socket_path: []const u8, send_timeout_m
     return fd;
 }
 
-/// Attach the calling terminal to a session. Blocks until detach or
-/// session end. Stdin/stdout must be the controlling TTY.
-pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
+/// How an attachment ended, and the session it ended on, which differs
+/// from the first one after a switch. The caller owns `session`.
+pub const Ending = struct {
+    outcome: Outcome,
+    session: []u8,
+};
+
+/// A connection to another session that the client attaches next.
+const Move = struct {
+    sock: posix.fd_t,
+    session: []u8,
+};
+
+/// Where relaying one session's connection led.
+const Step = union(enum) {
+    end: Outcome,
+    move: Move,
+};
+
+/// Attach the calling terminal to session `name` in `dir`. Blocks until
+/// detach or session end, following switches from one session to
+/// another. Stdin/stdout must be the controlling TTY.
+pub fn attach(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !Ending {
     const tty: posix.fd_t = 0;
     if (!posix.isatty(tty)) return error.NotATty;
 
-    const sock = try connect(alloc, socket_path, null);
+    var session = try alloc.dupe(u8, name);
+    errdefer alloc.free(session);
+    var previous: ?[]u8 = null;
+    defer if (previous) |p| alloc.free(p);
+    const first_path = try paths.socketPath(alloc, dir, session);
+    defer alloc.free(first_path);
+    var sock = try connect(alloc, first_path, null);
     defer posix.close(sock);
 
     // Signal plumbing: SIGWINCH resizes, SIGTERM/SIGHUP detach.
@@ -108,28 +135,79 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     defer restoreTty(tty, saved, restore_sequence, eof_guard, 'd');
     try protocol.writeAll(1, enter_sequence);
 
-    // Handshake with our current size first so the daemon sees the
-    // attach promptly. The background probe below blocks briefly; a kill
-    // or resize racing a slow attach would otherwise break the
-    // connection or miss the initial size.
-    const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
-    try protocol.writeMsg(sock, .attach, &(protocol.AttachPayload{
-        .size = .{ .rows = ws.row, .cols = ws.col },
-        .tty_device = try ptypkg.ttyDevice(tty),
-    }).encode());
+    var tty_name_buf: [256]u8 = undefined;
+    const tty_name = try ptypkg.ttyName(tty, &tty_name_buf);
+    const tty_device = try ptypkg.ttyDevice(tty);
+    var reason: protocol.AttachReason = .attach;
+    var background: ?protocol.RgbPayload = null;
+    while (true) {
+        // Handshake with our current size first so the daemon sees the
+        // attach promptly. The background probe below blocks briefly; a
+        // kill or resize racing a slow attach would otherwise break the
+        // connection or miss the initial size.
+        const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
+        const request = try (protocol.AttachPayload{
+            .size = .{ .rows = ws.row, .cols = ws.col },
+            .tty_device = tty_device,
+            .reason = reason,
+            .tty_name = tty_name,
+        }).encode(alloc);
+        defer alloc.free(request);
+        try protocol.writeMsg(sock, .attach, request);
 
-    // Probe the real terminal's background color so the daemon can
-    // answer OSC 11 theme queries from inside the session, where the
-    // application can no longer reach this terminal. The probe yields to
-    // a pending signal, and any keystrokes typed during it are forwarded
-    // as input afterward.
-    var probe_scratch: [256]u8 = undefined;
-    var leftover_len: usize = 0;
-    if (probeBackground(tty, pipe_fds[0], &probe_scratch, &leftover_len)) |color| {
-        protocol.writeMsg(sock, .bg_color, &color.encode()) catch {};
+        // Probe the real terminal's background color once, so each
+        // daemon can answer OSC 11 theme queries from inside its
+        // session, where the application can no longer reach this
+        // terminal. The probe yields to a pending signal, and any
+        // keystrokes typed during it are forwarded as input afterward.
+        if (reason == .attach) {
+            var probe_scratch: [256]u8 = undefined;
+            var leftover_len: usize = 0;
+            background = probeBackground(tty, pipe_fds[0], &probe_scratch, &leftover_len);
+            if (leftover_len > 0) protocol.writeMsg(sock, .input, probe_scratch[0..leftover_len]) catch {};
+        }
+        if (background) |color| protocol.writeMsg(sock, .bg_color, &color.encode()) catch {};
+
+        switch (try relay(alloc, dir, sock, pipe_fds[0], previous, &eof_guard)) {
+            .end => |outcome| return .{ .outcome = outcome, .session = session },
+            .move => |move| {
+                posix.close(sock);
+                sock = move.sock;
+                if (previous) |p| alloc.free(p);
+                previous = session;
+                session = move.session;
+                reason = .switch_client;
+            },
+        }
     }
-    if (leftover_len > 0) protocol.writeMsg(sock, .input, probe_scratch[0..leftover_len]) catch {};
+}
 
+/// Connect to session `name` for a switch, or return null when it cannot
+/// be reached, which leaves the client where it is.
+fn connectMove(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !?Move {
+    paths.validateName(name) catch return null;
+    const path = try paths.socketPath(alloc, dir, name);
+    defer alloc.free(path);
+    const sock = connect(alloc, path, null) catch |err| switch (err) {
+        error.FileNotFound, error.ConnectionRefused => return null,
+        else => return err,
+    };
+    errdefer posix.close(sock);
+    return .{ .sock = sock, .session = try alloc.dupe(u8, name) };
+}
+
+/// Relay between the terminal and one session's connection until the
+/// attachment ends or the client moves to another session. `previous`
+/// is the session `C-a L` returns to, if any.
+fn relay(
+    alloc: std.mem.Allocator,
+    dir: []const u8,
+    sock: posix.fd_t,
+    signal_fd: posix.fd_t,
+    previous: ?[]const u8,
+    eof_guard: *bool,
+) !Step {
+    const tty: posix.fd_t = 0;
     var decoder: protocol.Decoder = .init(alloc);
     defer decoder.deinit();
 
@@ -137,7 +215,7 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     var fds = [_]posix.pollfd{
         .{ .fd = tty, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = sock, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = pipe_fds[0], .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = signal_fd, .events = posix.POLL.IN, .revents = 0 },
     };
 
     var stdin_open = true;
@@ -151,7 +229,7 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
         // Signals.
         if (fds[2].revents != 0) {
             while (true) {
-                const n = posix.read(pipe_fds[0], &buf) catch 0;
+                const n = posix.read(signal_fd, &buf) catch 0;
                 if (n == 0) break;
                 for (buf[0..n]) |sig| switch (sig) {
                     posix.SIG.WINCH => {
@@ -190,7 +268,7 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
         // Daemon -> terminal output and lifecycle messages.
         if (fds[1].revents != 0) {
             const n = posix.read(sock, &buf) catch 0;
-            if (n == 0) return .lost;
+            if (n == 0) return .{ .end = .lost };
             try decoder.feed(buf[0..n]);
             while (try decoder.next()) |msg| {
                 switch (msg.type) {
@@ -198,19 +276,27 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
                     // of a large output can be written as they arrive.
                     .part, .output => try protocol.writeAll(1, msg.payload),
                     .detached => {
-                        if (std.mem.eql(u8, msg.payload, "stolen")) return .stolen;
-                        if (std.mem.eql(u8, msg.payload, "nested")) return .nested;
+                        if (std.mem.eql(u8, msg.payload, "stolen")) return .{ .end = .stolen };
+                        if (std.mem.eql(u8, msg.payload, "nested")) return .{ .end = .nested };
                         if (std.mem.eql(u8, msg.payload, "detached-eof")) {
-                            eof_guard = true;
+                            eof_guard.* = true;
                         }
-                        return .detached;
+                        return .{ .end = .detached };
                     },
                     .exit => {
                         // Sessions often end because the user typed
                         // C-d at the session's shell; treat the tail
                         // as EOF-dangerous.
-                        eof_guard = true;
-                        return .ended;
+                        eof_guard.* = true;
+                        return .{ .end = .ended };
+                    },
+                    // A session that cannot be reached leaves the client
+                    // where it is.
+                    .switch_to => if (try connectMove(alloc, dir, msg.payload)) |move| {
+                        return .{ .move = move };
+                    },
+                    .switch_back => if (previous) |p| if (try connectMove(alloc, dir, p)) |move| {
+                        return .{ .move = move };
                     },
                     else => {},
                 }

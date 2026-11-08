@@ -71,6 +71,7 @@ pub fn main() !void {
     if (eql(cmd, "wait")) return cmdWait(alloc, rest);
     if (eql(cmd, "kill")) return cmdKill(alloc, rest);
     if (eql(cmd, "rename")) return cmdRename(alloc, rest);
+    if (eql(cmd, "switch")) return cmdSwitch(alloc, rest);
     if (eql(cmd, "version") or eql(cmd, "-V") or eql(cmd, "--version")) return cmdVersion(alloc);
     if (eql(cmd, "help") or eql(cmd, "-h") or eql(cmd, "--help")) return cmdHelp(alloc, rest);
     fail(exit_usage, "unknown command '{s}' (run 'pane help')", .{cmd});
@@ -205,7 +206,7 @@ fn requireSession(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !
 
 pub const SessionInfo = struct {
     /// Full info payload: name \t Attached|Detached \t idle_ms \t
-    /// out_idle_ms \t unread \t bell_idle_ms \t pid \t title.
+    /// out_idle_ms \t unread \t bell_idle_ms \t pid \t client \t title.
     text: []u8,
     attached: bool,
     idle_ms: i64,
@@ -218,6 +219,9 @@ pub const SessionInfo = struct {
     bell_idle_ms: i64,
     /// The session command's pid, or -1 once it has exited.
     pid: posix.pid_t,
+    /// The path of the attached client's terminal, empty when none is
+    /// attached; slices into `text`.
+    client: []const u8,
     /// Window title; slices into `text`.
     title: []const u8,
 };
@@ -287,6 +291,7 @@ pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, 
         return error.BadResponse;
     const pid = std.fmt.parseInt(posix.pid_t, it.next() orelse return error.BadResponse, 10) catch
         return error.BadResponse;
+    const client_tty = it.next() orelse return error.BadResponse;
     return .{
         .info = .{
             .text = result.text,
@@ -296,6 +301,7 @@ pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, 
             .unread = unread,
             .bell_idle_ms = bell_idle_ms,
             .pid = pid,
+            .client = client_tty,
             // The daemon strips control bytes from the title, so it holds no
             // tab and runs to the end of the payload.
             .title = it.rest(),
@@ -457,9 +463,7 @@ fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 }
 
 fn attachLoop(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
-    const sock = try paths.socketPath(alloc, dir, name);
-    defer alloc.free(sock);
-    const outcome = client.attach(alloc, sock) catch |err| switch (err) {
+    const ending = client.attach(alloc, dir, name) catch |err| switch (err) {
         error.FileNotFound, error.ConnectionRefused => fail(
             exit_no_session,
             "no session named {s}",
@@ -468,13 +472,15 @@ fn attachLoop(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void
         error.NotATty => fail(exit_runtime, "attach requires a terminal", .{}),
         else => return err,
     };
-    switch (outcome) {
-        .detached => std.debug.print("[detached from {s}]\n", .{name}),
-        .stolen => std.debug.print("[session {s} attached elsewhere]\n", .{name}),
-        .nested => fail(exit_runtime, "already inside session {s} (detach with C-a d to leave it)", .{name}),
-        .ended => std.debug.print("[session {s} ended]\n", .{name}),
+    defer alloc.free(ending.session);
+    const session = ending.session;
+    switch (ending.outcome) {
+        .detached => std.debug.print("[detached from {s}]\n", .{session}),
+        .stolen => std.debug.print("[session {s} attached elsewhere]\n", .{session}),
+        .nested => fail(exit_runtime, "already inside session {s} (detach with C-a d to leave it)", .{session}),
+        .ended => std.debug.print("[session {s} ended]\n", .{session}),
         .lost => {
-            std.debug.print("[lost connection to {s}]\n", .{name});
+            std.debug.print("[lost connection to {s}]\n", .{session});
             posix.exit(exit_runtime);
         },
     }
@@ -546,6 +552,12 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             defer alloc.free(tail);
             try out.appendSlice(alloc, tail);
             try appendJsonString(alloc, &out, info.title);
+            try out.appendSlice(alloc, ",\"client\":");
+            if (info.attached) {
+                try appendJsonString(alloc, &out, info.client);
+            } else {
+                try out.appendSlice(alloc, "null");
+            }
             try out.append(alloc, '}');
         }
         try out.appendSlice(alloc, "]\n");
@@ -939,6 +951,66 @@ fn cmdRename(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     const result = try mustControl(alloc, dir, name, &.{ "rename", new_name });
     defer alloc.free(result.text);
     if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
+}
+
+fn cmdSwitch(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var client_arg: ?[]const u8 = null;
+    var session_arg: ?[]const u8 = null;
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage("switch");
+        if (arg.len > 0 and arg[0] == '-') {
+            usageFail("switch", "unknown flag '{s}'", .{arg});
+        } else if (client_arg == null) {
+            client_arg = arg;
+        } else if (session_arg == null) {
+            session_arg = arg;
+        } else {
+            usageFail("switch", "unexpected argument '{s}'", .{arg});
+        }
+    }
+    const client_name = client_arg orelse usageFail("switch", "a client is required", .{});
+    const target = session_arg orelse usageFail("switch", "a session name is required", .{});
+
+    const dir = try socketDir(alloc);
+    defer alloc.free(dir);
+    try requireSession(alloc, dir, target);
+    const host = try clientSession(alloc, dir, client_name);
+    defer alloc.free(host);
+
+    const result = try mustControl(alloc, dir, host, &.{ "switch", target });
+    defer alloc.free(result.text);
+    if (!result.ok) fail(exit_runtime, "session {s}: {s}", .{ host, result.text });
+}
+
+/// The owned name of the session that `client` names: the session the
+/// client is attached to, or the terminal it runs on, as a path like
+/// /dev/pts/3 or the same path without /dev/. Exits when there is no such
+/// session or client.
+fn clientSession(alloc: std.mem.Allocator, dir: []const u8, client_name: []const u8) ![]u8 {
+    // A session name holds no '/', and a terminal path always does.
+    if (std.mem.indexOfScalar(u8, client_name, '/') == null) {
+        try requireSession(alloc, dir, client_name);
+        return alloc.dupe(u8, client_name);
+    }
+
+    const sessions = try paths.listSessions(alloc, dir);
+    defer {
+        for (sessions) |s| alloc.free(s);
+        alloc.free(sessions);
+    }
+    for (sessions) |name| {
+        const reply = sessionInfo(alloc, dir, name, ls_timeout_ms) catch continue;
+        const info = switch (reply) {
+            .info => |info| info,
+            .busy, .gone => continue,
+        };
+        defer alloc.free(info.text);
+        const tty = info.client;
+        const on_tty = std.mem.eql(u8, tty, client_name) or
+            (std.mem.startsWith(u8, tty, "/dev/") and std.mem.eql(u8, tty["/dev/".len..], client_name));
+        if (info.attached and on_tty) return alloc.dupe(u8, name);
+    }
+    fail(exit_runtime, "no client on terminal {s} (run 'pane ls --json' to see clients)", .{client_name});
 }
 
 fn cmdVersion(alloc: std.mem.Allocator) !void {

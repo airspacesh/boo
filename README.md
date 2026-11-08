@@ -35,9 +35,11 @@ pane new work               # start a session named work and attach
 pane ls                     # list sessions
 pane attach work            # reattach
 pane kill work              # end a session
+pane switch work build      # show build where work is shown
 ```
 
-Inside a session, `C-a d` detaches and `C-a Esc` scrolls the history.
+Inside a session, `C-a d` detaches, `C-a Esc` scrolls the history, and
+`C-a L` returns to the session you switched from.
 Run `pane help` for every command and key.
 
 ## License

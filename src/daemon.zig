@@ -58,6 +58,10 @@ pub const max_dimension: u16 = 4096;
 /// backlog, so accepting again at once would spin.
 const accept_backoff_ms: i64 = 100;
 
+/// How long the notice that a client switched here stays up before a
+/// key clears it.
+const switch_notice_ms: i64 = 1000;
+
 /// Upper bound on how long teardown waits for queued finals to drain.
 const shutdown_drain_ms: i64 = 250;
 
@@ -100,6 +104,12 @@ const Conn = struct {
     /// Limit on `out` (see `max_conn_out`); a field so tests can shrink
     /// it.
     out_cap: usize = max_conn_out,
+    /// The path of the attached client's terminal, which names the
+    /// client to `pane switch`. Owned.
+    tty_name: []u8 = &.{},
+    /// Monotonic time at which the client switched here, while the
+    /// notice saying so is up.
+    switch_notice_since_ms: ?i64 = null,
 
     /// Whether `out` has grown past `out_cap`.
     fn behind(self: *const Conn) bool {
@@ -156,6 +166,7 @@ const Conn = struct {
     }
 
     fn deinit(self: *Conn) void {
+        self.alloc.free(self.tty_name);
         self.out.deinit(self.alloc);
         self.decoder.deinit();
     }
@@ -490,6 +501,10 @@ pub const Daemon = struct {
                     }
                 }
                 conn.attached = true;
+                const tty_name = try self.alloc.dupe(u8, request.tty_name);
+                self.alloc.free(conn.tty_name);
+                conn.tty_name = tty_name;
+                if (request.reason == .switch_client) conn.switch_notice_since_ms = monotonicMs();
                 // Attaching is viewing, so the session's output is no
                 // longer unseen.
                 self.unread = false;
@@ -504,6 +519,12 @@ pub const Daemon = struct {
                 if (!conn.attached) return;
                 self.last_activity_ms = std.time.milliTimestamp();
                 self.key_input_timer.reset();
+                // The first key after the notice has been up a while
+                // clears it, with a repaint of what it covered.
+                if (conn.switch_notice_since_ms) |since_ms| if (monotonicMs() - since_ms >= switch_notice_ms) {
+                    conn.switch_notice_since_ms = null;
+                    conn.view = .stale;
+                };
                 // When the window runs the kitty keyboard protocol
                 // or modifyOtherKeys, the client's terminal mirrors
                 // it and sends the prefix key encoded.
@@ -556,6 +577,7 @@ pub const Daemon = struct {
             ),
             .redraw => conn.view = .stale,
             .copy_mode => self.enterCopyMode(conn),
+            .switch_back => conn.send(.switch_back, ""),
             .unknown => |byte| if (std.ascii.isPrint(byte))
                 self.message(conn, "unknown key: ^A {c}", .{byte})
             else
@@ -644,10 +666,7 @@ pub const Daemon = struct {
                 conn.send(.ok, out.written());
             } else conn.send(.err, "no window");
         } else if (std.mem.eql(u8, cmd, "info")) {
-            var attached = false;
-            for (self.conns.items) |c| {
-                if (c.attached and !c.closed) attached = true;
-            }
+            const viewer = self.attachedConn();
             const idle: i64 = @max(0, now - self.last_activity_ms);
             const out_idle: i64 = if (self.liveWindow()) |w|
                 @max(0, now - w.last_output_ms)
@@ -664,14 +683,17 @@ pub const Daemon = struct {
             const pid: posix.pid_t = if (self.liveWindow()) |w| w.child_pid else -1;
             var out: std.Io.Writer.Allocating = .init(self.alloc);
             defer out.deinit();
-            try out.writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t", .{
+            try out.writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{s}\t", .{
                 self.opts.name,
-                if (attached) "Attached" else "Detached",
+                if (viewer != null) "Attached" else "Detached",
                 idle,
                 out_idle,
                 @intFromBool(self.unread),
                 bell_idle,
                 pid,
+                // Empty when no client is attached. A terminal path holds
+                // no tab.
+                if (viewer) |v| v.tty_name else "",
             });
             // Window title last; sanitized, so it cannot contain the
             // tabs that separate the fields.
@@ -679,6 +701,17 @@ pub const Daemon = struct {
                 try windowpkg.writePrintable(w.title(), &out.writer);
             }
             conn.send(.ok, out.written());
+        } else if (std.mem.eql(u8, cmd, "switch")) {
+            if (argv.len != 2) {
+                conn.send(.err, "usage: switch <session>");
+                return;
+            }
+            const viewer = self.attachedConn() orelse {
+                conn.send(.err, "no client is attached");
+                return;
+            };
+            viewer.send(.switch_to, argv[1]);
+            conn.send(.ok, "");
         } else if (std.mem.eql(u8, cmd, "rename")) {
             if (argv.len != 2) {
                 conn.send(.err, "usage: rename <new-name>");
@@ -976,6 +1009,9 @@ pub const Daemon = struct {
         win.alt_filter.reset();
         conn.view = if (win.atGround()) .current else .torn;
         conn.send(.output, bytes);
+        if (!conn.copy_mode and conn.switch_notice_since_ms != null) {
+            self.message(conn, "switched to {s}", .{self.opts.name});
+        }
     }
 
     fn detachConn(self: *Daemon, conn: *Conn, reason: []const u8) void {

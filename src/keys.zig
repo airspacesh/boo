@@ -48,6 +48,8 @@ pub const Command = union(enum) {
     detach: u8,
     redraw,
     copy_mode,
+    /// Return to the session the client switched from.
+    switch_back,
     unknown: u8,
 };
 
@@ -219,6 +221,11 @@ pub const Parser = struct {
             if (ctrl_only and cp >= 'a' and cp <= 'z') {
                 return dispatch(@intCast(cp & 0x1f), handler);
             }
+            // Under the "report all keys" flag a shifted letter arrives
+            // as its unshifted codepoint with the shift bit.
+            if (mods == 0x1 and cp >= 'a' and cp <= 'z') {
+                return dispatch(std.ascii.toUpper(@intCast(cp)), handler);
+            }
             // Kitty reports Esc as codepoint 27, below the printable
             // range.
             if (plain and (cp == 0x1b or (cp >= 0x20 and cp <= 0x7f))) {
@@ -301,6 +308,7 @@ pub const Parser = struct {
             'd', 0x04 => try handler.command(.{ .detach = byte }),
             'l', 0x0c => try handler.command(.redraw),
             0x1b, '[' => try handler.command(.copy_mode),
+            'L' => try handler.command(.switch_back),
             'a' => try handler.command(.{ .forward = &.{escape_byte} }),
             else => try handler.command(.{ .unknown = byte }),
         }
@@ -576,6 +584,18 @@ test "kitty: report-all plain d arrives as CSI-u and detaches" {
     try p.feed("\x1b[97;5u\x1b[100u", .{ .kitty = true }, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
     try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
+}
+
+test "C-a L returns to the previous session, also as a report-all shifted key" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{};
+    try p.feed("\x01L", .{}, &h);
+    try p.feed("\x1b[97;5u\x1b[108;2u", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 2), h.cmds.items.len);
+    try std.testing.expectEqual(Command.switch_back, h.cmds.items[0]);
+    try std.testing.expectEqual(Command.switch_back, h.cmds.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
 test "kitty: sequence split across feeds" {

@@ -1394,6 +1394,8 @@ test "ls emits machine-readable JSON" {
         try std.testing.expectEqual(false, obj.get("unread").?.bool);
         // No bell has rung, so there is no "your turn".
         try std.testing.expectEqual(@as(i64, -1), obj.get("bell_idle_ms").?.integer);
+        // No client is attached.
+        try std.testing.expectEqual(std.json.Value.null, obj.get("client").?);
         // The pid names the running cat.
         const pid: std.posix.pid_t = @intCast(obj.get("pid").?.integer);
         try std.posix.kill(pid, 0);
@@ -2510,4 +2512,90 @@ test "copy mode sends a client that stops reading a bounded number of frames" {
     try client.send("q\x01d");
     try client.waitFor("detached from copyflood");
     _ = try client.waitExit();
+}
+
+/// The terminal of the client attached to `session`, from `pane ls
+/// --json`, or null when no client is attached. Owned.
+fn sessionClient(h: *Harness, session: []const u8) !?[]u8 {
+    const ls = try h.run(&.{ "ls", "--json" });
+    defer h.alloc.free(ls.stdout);
+    defer h.alloc.free(ls.stderr);
+    var parsed = try std.json.parseFromSlice(std.json.Value, h.alloc, ls.stdout, .{});
+    defer parsed.deinit();
+    for (parsed.value.array.items) |item| {
+        const obj = item.object;
+        if (!std.mem.eql(u8, obj.get("name").?.string, session)) continue;
+        return switch (obj.get("client").?) {
+            .string => |tty| try h.alloc.dupe(u8, tty),
+            else => null,
+        };
+    }
+    return error.NoSuchSession;
+}
+
+test "switch moves a client between sessions, and C-a L brings it back" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("left", &.{"cat"});
+    try h.startDetached("right", &.{"cat"});
+    try h.sendLine("left", "left-screen");
+    try h.sendLine("right", "right-screen");
+    alloc.free(try h.waitPeekContains("left", "left-screen"));
+    alloc.free(try h.waitPeekContains("right", "right-screen"));
+
+    var client = try PtyClient.spawn(&h, &.{ "attach", "left" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("left-screen");
+
+    // Named by the session it shows.
+    client.clearOutput();
+    try h.runOk(&.{ "switch", "left", "right" });
+    try client.waitFor("right-screen");
+    try client.waitFor("switched to right");
+    try std.testing.expectEqual(null, try sessionClient(&h, "left"));
+    const tty = (try sessionClient(&h, "right")).?;
+    defer alloc.free(tty);
+    try std.testing.expect(std.mem.startsWith(u8, tty, "/dev/"));
+
+    // Keys reach the session the client now shows.
+    try client.send("typed-into-right\r");
+    alloc.free(try h.waitPeekContains("right", "typed-into-right"));
+
+    // A key a second after the switch clears the notice with a repaint.
+    std.Thread.sleep(1100 * std.time.ns_per_ms);
+    client.clearOutput();
+    try client.send("x");
+    try client.waitFor("right-screen");
+    while (try client.pump(200)) {}
+    try std.testing.expect(std.mem.indexOf(u8, client.output.items, "switched to") == null);
+
+    client.clearOutput();
+    try client.send("\x01L");
+    try client.waitFor("left-screen");
+    try client.waitFor("switched to left");
+
+    // Named by its terminal's path.
+    client.clearOutput();
+    try h.runOk(&.{ "switch", tty, "right" });
+    try client.waitFor("right-screen");
+    // Or by the path without /dev/, where that still holds a '/' (pts/3
+    // on Linux, though not ttys003 on macOS).
+    const short = tty["/dev/".len..];
+    if (std.mem.indexOfScalar(u8, short, '/') != null) {
+        client.clearOutput();
+        try h.runOk(&.{ "switch", short, "left" });
+        try client.waitFor("left-screen");
+    } else {
+        try h.runOk(&.{ "switch", tty, "left" });
+    }
+
+    try h.runExit(&.{ "switch", "left", "missing" }, 3);
+    try h.runExit(&.{ "switch", "right", "left" }, 1);
+    try h.runExit(&.{ "switch", "/dev/no-such-tty", "left" }, 1);
+
+    try client.send("\x01d");
+    try client.waitFor("detached from left");
+    try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
 }

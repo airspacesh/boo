@@ -41,6 +41,11 @@ pub const MsgType = enum(u8) {
     /// pieces arrive in order, and a message of the payload's own type
     /// carries the last piece (see `appendMsg`).
     part = 69,
+    /// Attach the session the payload names in place of this one, as
+    /// `pane switch` asked.
+    switch_to = 70,
+    /// Attach the session this client switched from, as `C-a L` asked.
+    switch_back = 71,
     _,
 };
 
@@ -70,24 +75,42 @@ pub const SizePayload = struct {
     }
 };
 
-/// An attach request: the client terminal's size, and its device number,
-/// which the daemon compares with the session's own terminal.
+/// Why a client attaches.
+pub const AttachReason = enum(u8) {
+    /// `pane attach` or `pane new`.
+    attach = 0,
+    /// The client moved here from another session.
+    switch_client = 1,
+};
+
+/// An attach request: the client terminal's size, its device number,
+/// which the daemon compares with the session's own terminal, why it
+/// attaches, and the terminal's path, which names the client.
 pub const AttachPayload = struct {
     size: SizePayload,
     tty_device: u64,
+    reason: AttachReason,
+    /// Borrowed from the payload when decoded.
+    tty_name: []const u8,
 
-    pub fn encode(self: AttachPayload) [12]u8 {
-        var buf: [12]u8 = undefined;
+    const fixed_len = 13;
+
+    pub fn encode(self: AttachPayload, alloc: std.mem.Allocator) ![]u8 {
+        const buf = try alloc.alloc(u8, fixed_len + self.tty_name.len);
         buf[0..4].* = self.size.encode();
         std.mem.writeInt(u64, buf[4..12], self.tty_device, .little);
+        buf[12] = @intFromEnum(self.reason);
+        @memcpy(buf[fixed_len..], self.tty_name);
         return buf;
     }
 
     pub fn decode(payload: []const u8) error{InvalidPayload}!AttachPayload {
-        if (payload.len != 12) return error.InvalidPayload;
+        if (payload.len < fixed_len) return error.InvalidPayload;
         return .{
             .size = try SizePayload.decode(payload[0..4]),
             .tty_device = std.mem.readInt(u64, payload[4..12], .little),
+            .reason = std.enums.fromInt(AttachReason, payload[12]) orelse return error.InvalidPayload,
+            .tty_name = payload[fixed_len..],
         };
     }
 };
@@ -247,10 +270,24 @@ test "size payload roundtrip" {
     const dec = try SizePayload.decode(&enc);
     try std.testing.expectEqual(size, dec);
     try std.testing.expectError(error.InvalidPayload, SizePayload.decode("abc"));
+}
 
-    const request: AttachPayload = .{ .size = size, .tty_device = 0x1000_0000_0000_0042 };
-    try std.testing.expectEqual(request, try AttachPayload.decode(&request.encode()));
-    try std.testing.expectError(error.InvalidPayload, AttachPayload.decode(&enc));
+test "attach payload roundtrip" {
+    const alloc = std.testing.allocator;
+    const request: AttachPayload = .{
+        .size = .{ .rows = 51, .cols = 213 },
+        .tty_device = 0x1000_0000_0000_0042,
+        .reason = .switch_client,
+        .tty_name = "/dev/pts/3",
+    };
+    const enc = try request.encode(alloc);
+    defer alloc.free(enc);
+    const dec = try AttachPayload.decode(enc);
+    try std.testing.expectEqual(request.size, dec.size);
+    try std.testing.expectEqual(request.tty_device, dec.tty_device);
+    try std.testing.expectEqual(request.reason, dec.reason);
+    try std.testing.expectEqualStrings(request.tty_name, dec.tty_name);
+    try std.testing.expectError(error.InvalidPayload, AttachPayload.decode(enc[0..12]));
 }
 
 test "rgb payload roundtrip and luminance" {

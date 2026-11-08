@@ -27,6 +27,7 @@ pub const overview =
     \\  Session Management
     \\    new [name] [-d] [-- cmd...]  start a session (attach unless -d)
     \\    attach, at, a <name>         attach a session (steals politely)
+    \\    switch <client> <session>    show another session in a client
     \\    ls [--json]                  list sessions
     \\
     \\  Interaction
@@ -117,6 +118,24 @@ pub const commands = [_]Entry{
         ,
     },
     .{
+        .name = "switch",
+        .body =
+        \\usage: pane switch <client> <session>
+        \\
+        \\Show another session in an attached client, as if it had
+        \\attached that session itself. Name the client by the session
+        \\it shows now, or by its terminal, like /dev/pts/3 or pts/3
+        \\('pane ls --json' lists each session's client). The client
+        \\shows "switched to <session>" until a key is pressed a second
+        \\after the switch, and C-a L takes it back.
+        \\
+        \\examples:
+        \\  pane switch chief build     show build where chief is shown
+        \\  pane switch pts/3 build     show build on terminal pts/3
+        \\
+        ,
+    },
+    .{
         .name = "ls",
         .alias = "list",
         .body =
@@ -130,10 +149,11 @@ pub const commands = [_]Entry{
         \\flags:
         \\  --json  emit a JSON array:
         \\          [{"name","responding","attached","idle_ms","unread",
-        \\            "bell_idle_ms","pid","title"}]
+        \\            "bell_idle_ms","pid","title","client"}]
         \\          ("unread" flags unseen output; "bell_idle_ms" is the
         \\           age of a bell rung while away, -1 if none; "pid" is
-        \\           the session command's pid, -1 once it has exited)
+        \\           the session command's pid, -1 once it has exited;
+        \\           "client" is the attached client's terminal, or null)
         \\          A busy session has only "name" and "responding".
         \\
         ,
@@ -270,6 +290,7 @@ pub const topics = [_]Entry{
         \\  C-a d   detach
         \\  C-a l   redraw
         \\  C-a [   scroll the session's history (copy mode), also C-a Esc
+        \\  C-a L   return to the session you switched from
         \\  C-a a   send a literal C-a
         \\
         \\Control variants match GNU screen: C-a C-d detaches and
@@ -324,7 +345,7 @@ pub const topics = [_]Entry{
         \\
         \\machine-readable output:
         \\  pane ls --json    [{"name","responding","attached","idle_ms",
-        \\                    "unread","bell_idle_ms","pid","title"}]
+        \\                    "unread","bell_idle_ms","pid","title","client"}]
         \\  pane peek --json  {"session","title","rows","cols",
         \\                    "cursor":{"row","col"},"screen"}
         \\

@@ -8,6 +8,7 @@ extern "c" fn posix_openpt(flags: c_int) c_int;
 extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname_r(fd: c_int, buf: [*]u8, len: usize) c_int;
+extern "c" fn ttyname_r(fd: c_int, buf: [*]u8, len: usize) c_int;
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 
 /// Terminal ioctl request codes. Zig's std does not define the set
@@ -111,6 +112,13 @@ pub fn ttyDevice(fd: posix.fd_t) !u64 {
     const rdev = (try posix.fstat(fd)).rdev;
     const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(rdev)));
     return @as(Bits, @bitCast(rdev));
+}
+
+/// The path of the terminal open on `fd`, like /dev/pts/3, written into
+/// `buf`.
+pub fn ttyName(fd: posix.fd_t, buf: []u8) ![]const u8 {
+    if (ttyname_r(fd, buf.ptr, buf.len) != 0) return error.NotATty;
+    return std.mem.sliceTo(buf, 0);
 }
 
 /// Why a forked child could not start the session command.
