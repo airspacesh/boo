@@ -303,7 +303,8 @@ pub const topics = [_]Entry{
         \\  C-a a   send a literal C-a
         \\
         \\Control variants match GNU screen: C-a C-d detaches and
-        \\C-a C-l redraws. Detaching leaves the session running;
+        \\C-a C-l redraws. C-a C-m opens the menu, so ctrl may stay
+        \\held for it too. Detaching leaves the session running;
         \\'pane attach' brings it back.
         \\
         \\Copy mode keys
