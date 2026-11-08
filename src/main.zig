@@ -407,11 +407,29 @@ fn createSession(
         try daemonpkg.Daemon.run(alloc, session, opts);
         return;
     }
+    const started = try posix.pipe2(.{ .CLOEXEC = true });
     const pid = try posix.fork();
     if (pid == 0) {
-        runDaemon(alloc, name, session, cmd_argv, rows, cols, cwd);
+        posix.close(started[0]);
+        runDaemon(alloc, name, session, cmd_argv, rows, cols, cwd, started[1]);
     }
     session.closeInherited(alloc);
+
+    // The daemon closes the pipe once the session command runs, after
+    // writing why it could not start the command, if it could not.
+    posix.close(started[1]);
+    var why_buf: [256]u8 = undefined;
+    var why_len: usize = 0;
+    while (why_len < why_buf.len) {
+        const n = try posix.read(started[0], why_buf[why_len..]);
+        if (n == 0) break;
+        why_len += n;
+    }
+    posix.close(started[0]);
+    if (why_len > 0) {
+        const command = if (cmd_argv.len > 0) cmd_argv[0] else "the shell";
+        fail(exit_runtime, "cannot start {s}: {s}", .{ command, why_buf[0..why_len] });
+    }
 
     if (detached) {
         // The name on stdout so scripts can capture it.
@@ -1041,6 +1059,7 @@ fn runDaemon(
     rows: ?u16,
     cols: ?u16,
     cwd: ?[]const u8,
+    started_fd: posix.fd_t,
 ) noreturn {
     _ = posix.setsid() catch {};
 
@@ -1065,6 +1084,7 @@ fn runDaemon(
     if (rows) |r| opts.rows = r;
     if (cols) |c| opts.cols = c;
     opts.cwd = cwd;
+    opts.started_fd = started_fd;
     daemonpkg.Daemon.run(alloc, session, opts) catch |err| {
         std.log.err("daemon failed: {}", .{err});
         posix.exit(1);

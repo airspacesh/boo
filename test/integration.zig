@@ -821,6 +821,19 @@ test "new --cwd starts the command in that directory" {
     try waitFileEquals(alloc, out_file, expected);
 }
 
+test "new reports a command that cannot start, and leaves no session" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    const result = try h.run(&.{ "new", "nocmd", "-d", "--", "/no/such/command" });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try std.testing.expect(result.term == .Exited and result.term.Exited == 1);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "/no/such/command") != null);
+    try h.runExit(&.{ "peek", "nocmd" }, 3);
+}
+
 test "new --cwd rejects a missing directory" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

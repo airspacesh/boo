@@ -34,6 +34,9 @@ pub const Options = struct {
     /// Working directory for the session command; null inherits the
     /// daemon's own directory.
     cwd: ?[]const u8 = null,
+    /// A pipe the daemon closes once the session command runs, after
+    /// writing the name of the error that kept it from starting, if any.
+    started_fd: ?posix.fd_t = null,
 };
 
 /// How much queued-but-unsent output a connection may hold. The daemon
@@ -250,7 +253,14 @@ pub const Daemon = struct {
             .flags = 0,
         }, null);
 
-        self.win = try createWindow(self.alloc, opts.name, opts.argv, self.rows, self.cols, opts.cwd);
+        self.win = createWindow(self.alloc, opts.name, opts.argv, self.rows, self.cols, opts.cwd) catch |err| {
+            if (opts.started_fd) |fd| {
+                protocol.writeAll(fd, @errorName(err)) catch {};
+                posix.close(fd);
+            }
+            return err;
+        };
+        if (opts.started_fd) |fd| posix.close(fd);
 
         try self.loop();
     }
