@@ -739,11 +739,12 @@ pub const Daemon = struct {
             // Not passed through: the window answers queries itself.
             win.feed(cleaned);
             self.noteBell(win, detached, now);
-            // Copy mode at the bottom of the history follows the output.
-            // Scrolled up, its viewport stays pinned to the rows it shows.
+            // Copy mode shows the output's effect. At the bottom of the
+            // history its viewport follows the output. Scrolled up, the
+            // viewport stays on the rows it shows, but the tag's counts
+            // change, and the history may drop those rows.
             const viewer = self.attachedConn() orelse return;
-            if (!viewer.copy_mode or !win.term.screens.active.viewportIsBottom()) return;
-            viewer.view = .stale;
+            if (viewer.copy_mode) viewer.view = .stale;
             return;
         };
 

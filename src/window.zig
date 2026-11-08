@@ -396,8 +396,11 @@ pub const Window = struct {
             history_rows - bar.offset,
             history_rows,
         });
-        const tag_col = self.term.cols -| tag.len + 1;
-        try out.writer.print("\x1b[0m\x1b[1;{d}H\x1b[7m{s}\x1b[0m", .{ tag_col, tag });
+        // Clipped to the row, so a narrow canvas does not wrap the tag
+        // onto the next one.
+        const shown = tag[0..@min(tag.len, self.term.cols)];
+        const tag_col = self.term.cols - shown.len + 1;
+        try out.writer.print("\x1b[0m\x1b[1;{d}H\x1b[7m{s}\x1b[0m", .{ tag_col, shown });
         try out.writer.writeAll(end_sync);
 
         return alloc.dupe(u8, out.writer.buffered());

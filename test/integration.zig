@@ -2003,6 +2003,19 @@ fn waitCopyFrame(alloc: std.mem.Allocator, client: *PtyClient, rows: u16, cols: 
     return renderScreen(alloc, client.output.items, rows, cols);
 }
 
+/// The rows a rendered copy mode frame is scrolled back, and the rows of
+/// history, from the tag that ends its first row.
+fn copyTag(screen: []const u8) ![2]u32 {
+    const first_row = screen[0 .. std.mem.indexOfScalar(u8, screen, '\n') orelse screen.len];
+    const open = std.mem.lastIndexOfScalar(u8, first_row, '[').?;
+    const slash = std.mem.indexOfScalarPos(u8, first_row, open, '/').?;
+    const close = std.mem.indexOfScalarPos(u8, first_row, slash, ']').?;
+    return .{
+        try std.fmt.parseInt(u32, first_row[open + 1 .. slash], 10),
+        try std.fmt.parseInt(u32, first_row[slash + 1 .. close], 10),
+    };
+}
+
 test "copy mode scrolls the history and returns to the live screen" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
@@ -2030,26 +2043,33 @@ test "copy mode scrolls the history and returns to the live screen" {
     // g goes to the top of the history, where the first lines are.
     client.clearOutput();
     try client.send("g");
-    {
+    const history_rows = history_rows: {
         const screen = try waitCopyFrame(alloc, &client, 24, 80);
         defer alloc.free(screen);
         try std.testing.expect(std.mem.indexOf(u8, screen, "HIST-001") != null);
         try std.testing.expect(std.mem.indexOf(u8, screen, "HIST-060") == null);
         // At the top, the rows scrolled back equal the rows of history.
-        const first_row = screen[0 .. std.mem.indexOfScalar(u8, screen, '\n') orelse screen.len];
-        const open = std.mem.lastIndexOfScalar(u8, first_row, '[').?;
-        const slash = std.mem.indexOfScalarPos(u8, first_row, open, '/').?;
-        const close = std.mem.indexOfScalarPos(u8, first_row, slash, ']').?;
-        try std.testing.expectEqualStrings(first_row[open + 1 .. slash], first_row[slash + 1 .. close]);
-    }
+        const tag = try copyTag(screen);
+        try std.testing.expectEqual(tag[1], tag[0]);
+        break :history_rows tag[1];
+    };
 
-    // Output while scrolled back stays out of the frame.
+    // Output while scrolled back stays out of the frame, which still
+    // shows the top of the history, now with more rows in it.
     client.clearOutput();
     try h.sendLine("copy", "echo LIVE-MARK");
     const live = try h.waitPeekContains("copy", "LIVE-MARK\n");
     alloc.free(live);
-    while (try client.pump(200)) {}
+    try pumpQuiet(&client);
     try std.testing.expect(std.mem.indexOf(u8, client.output.items, "LIVE-MARK") == null);
+    {
+        const screen = try renderScreen(alloc, client.output.items, 24, 80);
+        defer alloc.free(screen);
+        try std.testing.expect(std.mem.indexOf(u8, screen, "HIST-001") != null);
+        const tag = try copyTag(screen);
+        try std.testing.expectEqual(tag[1], tag[0]);
+        try std.testing.expect(tag[1] > history_rows);
+    }
 
     // q returns to the live screen, which has kept up, and typing reaches
     // the shell again.
@@ -2061,6 +2081,41 @@ test "copy mode scrolls the history and returns to the live screen" {
 
     try client.send("\x01d");
     try client.waitFor("detached from copy");
+    _ = try client.waitExit();
+}
+
+test "copy mode's tag stays on the first row of a narrow terminal" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // 120 lines on a 4x6 screen leave a tag, "[0/117]", wider than a row.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (0..120) |i| try text.print(alloc, "R{d}\r\n", .{i});
+    try startDetachedWriting(&h, "slim", 4, 6, text.items);
+    const peeked = try h.waitPeekContains("slim", "R119");
+    defer alloc.free(peeked);
+
+    var client = try PtyClient.spawn(&h, &.{ "attach", "slim" }, 4, 6);
+    defer client.deinit();
+    try client.waitFor("R119");
+    try client.send("\x01[");
+    try client.waitFor("\x1b[7m");
+    try pumpQuiet(&client);
+
+    // Below the tag's row, the frame shows the live screen's rows.
+    const screen = try renderScreen(alloc, client.output.items, 4, 6);
+    defer alloc.free(screen);
+    const below_tag = screen[std.mem.indexOfScalar(u8, screen, '\n').? + 1 ..];
+    const peeked_below = peeked[std.mem.indexOfScalar(u8, peeked, '\n').? + 1 ..];
+    try std.testing.expectEqualStrings(
+        std.mem.trimRight(u8, peeked_below, "\n"),
+        std.mem.trimRight(u8, below_tag, "\n"),
+    );
+
+    try client.send("q\x01d");
+    try client.waitFor("detached from slim");
     _ = try client.waitExit();
 }
 
