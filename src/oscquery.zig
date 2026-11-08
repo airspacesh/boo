@@ -68,7 +68,7 @@ pub const Filter = struct {
         var result: Result = .{};
         var run_start: usize = 0;
         var i: usize = 0;
-        while (i < input.len) : (i += 1) {
+        while (i < input.len) {
             const byte = input[i];
             if (self.len == 0) {
                 // Ground: only ESC can begin a query candidate.
@@ -76,30 +76,35 @@ pub const Filter = struct {
                     try writer.writeAll(input[run_start..i]);
                     self.hold(byte);
                 }
+                i += 1;
                 continue;
             }
 
             // Mid-candidate: try to extend the held prefix by one byte.
             self.buf[self.len] = byte;
             switch (classify(self.buf[0 .. self.len + 1])) {
-                .partial => self.len += 1,
+                .partial => {
+                    self.len += 1;
+                    i += 1;
+                },
                 .complete => {
                     // A full query: drop it. The daemon answers it.
                     self.len = 0;
                     result.background_queries += 1;
-                    run_start = i + 1;
+                    i += 1;
+                    run_start = i;
                 },
                 .no => {
-                    // The held prefix was ordinary output after all;
-                    // emit it verbatim, then reconsider the current byte.
-                    try writer.writeAll(self.buf[0..self.len]);
+                    // The held prefix was ordinary output after all, so
+                    // emit it verbatim and reconsider the current byte.
+                    // The ESC that ends `ESC ] 1 1 ; ? ESC` may begin
+                    // the next query instead, so it stays held.
+                    const ends_in_esc = self.len > 1 and self.buf[self.len - 1] == 0x1b;
+                    const emit_len = if (ends_in_esc) self.len - 1 else self.len;
+                    try writer.writeAll(self.buf[0..emit_len]);
                     self.len = 0;
-                    if (byte == 0x1b) {
-                        self.hold(byte);
-                        run_start = i + 1;
-                    } else {
-                        run_start = i;
-                    }
+                    if (ends_in_esc) self.hold(0x1b);
+                    run_start = i;
                 },
             }
         }
@@ -187,6 +192,15 @@ test "near-miss prefix is emitted verbatim" {
     var f: Filter = .{};
     // ESC ] 1 1 ; X is not a query; nothing is dropped.
     try testFeed(&f, "\x1b]11;X\x07", "\x1b]11;X\x07", 0);
+}
+
+test "query right after an unterminated query is removed" {
+    // The first query's ST is cut short by the ESC that begins the
+    // second, which must not reach the client's terminal.
+    var f: Filter = .{};
+    try testFeed(&f, "\x1b]11;?\x1b]11;?\x07x", "\x1b]11;?x", 1);
+    try testFeed(&f, "\x1b]11;?", "", 0);
+    try testFeed(&f, "\x1b]11;?\x07y", "\x1b]11;?y", 1);
 }
 
 test "lone ESC then ordinary bytes pass through" {
