@@ -523,10 +523,16 @@ const PtyClient = struct {
     }
 };
 
+/// Read a small file whole. Dir.readFileAlloc sizes the file with statx,
+/// which Linux added in 4.11, unless it is given a size hint.
+fn readSmall(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    return std.fs.cwd().readFileAllocOptions(alloc, path, max_bytes, 0, .of(u8), null);
+}
+
 fn waitFileEquals(alloc: std.mem.Allocator, path: []const u8, expected: []const u8) !void {
     var deadline = Deadline.init(default_timeout_ms);
     while (true) {
-        const content = std.fs.cwd().readFileAlloc(alloc, path, 4096) catch "";
+        const content = readSmall(alloc, path, 4096) catch "";
         defer if (content.len > 0) alloc.free(content);
         if (std.mem.eql(u8, content, expected)) return;
         deadline.tick("file never matched") catch |err| {
@@ -540,7 +546,7 @@ fn waitFileEquals(alloc: std.mem.Allocator, path: []const u8, expected: []const 
 fn waitPidFile(alloc: std.mem.Allocator, path: []const u8) !posix.pid_t {
     var deadline = Deadline.init(default_timeout_ms);
     while (true) {
-        const content = std.fs.cwd().readFileAlloc(alloc, path, 64) catch "";
+        const content = readSmall(alloc, path, 64) catch "";
         defer if (content.len > 0) alloc.free(content);
         const trimmed = std.mem.trim(u8, content, " \t\r\n");
         if (trimmed.len > 0) {
@@ -676,7 +682,7 @@ test "window size: initial attach size and SIGWINCH resize reach the app" {
     while (true) {
         try h.sendLine("t5", cmd1);
         std.Thread.sleep(50 * std.time.ns_per_ms);
-        const content = std.fs.cwd().readFileAlloc(alloc, size_file, 4096) catch "";
+        const content = readSmall(alloc, size_file, 4096) catch "";
         defer if (content.len > 0) alloc.free(content);
         if (std.mem.eql(u8, content, "30 90\n")) break;
         try deadline.tick("resize never reached the inner tty");
