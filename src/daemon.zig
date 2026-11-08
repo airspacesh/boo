@@ -490,7 +490,16 @@ pub const Daemon = struct {
             },
 
             .attach => {
-                const size = try protocol.SizePayload.decode(msg.payload);
+                const request = try protocol.AttachPayload.decode(msg.payload);
+                // A client running inside this session would draw the
+                // session into itself, and stealing it would leave the
+                // user's own view detached.
+                if (self.liveWindow()) |w| if (w.tty_device == request.tty_device) {
+                    conn.send(.detached, "nested");
+                    conn.shutdown = true;
+                    return;
+                };
+                const size = request.size;
                 // Steal from any previously attached client.
                 for (self.conns.items) |other| {
                     if (other != conn and other.attached) {

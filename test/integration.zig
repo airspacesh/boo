@@ -1894,6 +1894,25 @@ test "kill: peek immediately after kill reports no session" {
     }
 }
 
+test "attach refuses a client running inside the session it names" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_abs = try std.fs.cwd().realpath(exe_path, &exe_buf);
+    const script = try std.fmt.allocPrint(alloc, "{s} attach inner; echo \"EXIT=$?\"; exec cat", .{exe_abs});
+    defer alloc.free(script);
+
+    // The session's own command attaches the session, so the client
+    // runs on the session's terminal.
+    try h.startDetached("inner", &.{ "sh", "-c", script });
+    const screen = try h.waitPeekContains("inner", "EXIT=");
+    defer alloc.free(screen);
+    try std.testing.expect(std.mem.indexOf(u8, screen, "already inside session inner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, screen, "EXIT=1") != null);
+}
+
 test "rename: moves a session to a new name" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

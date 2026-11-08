@@ -100,7 +100,18 @@ pub const SpawnOptions = struct {
 pub const Spawned = struct {
     pid: posix.pid_t,
     master: posix.fd_t,
+    /// The session terminal's device number (see `ttyDevice`).
+    tty_device: u64,
 };
+
+/// The device number of the terminal open on `fd`, which tells two
+/// terminals apart. `st_rdev` is signed on some systems, so its bits are
+/// taken as they are.
+pub fn ttyDevice(fd: posix.fd_t) !u64 {
+    const rdev = (try posix.fstat(fd)).rdev;
+    const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(rdev)));
+    return @as(Bits, @bitCast(rdev));
+}
 
 /// Why a forked child could not start the session command.
 pub const StartError = posix.ExecveError || posix.ChangeCurDirError || error{TerminalSetupFailed};
@@ -190,6 +201,7 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
 
     // Parent. Drop the slave so the master sees EOF once the child
     // (the only remaining holder) exits.
+    const tty_device = try ttyDevice(pty.slave);
     posix.close(pty.slave);
-    return .{ .pid = pid, .master = pty.master };
+    return .{ .pid = pid, .master = pty.master, .tty_device = tty_device };
 }

@@ -471,6 +471,7 @@ fn attachLoop(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void
     switch (outcome) {
         .detached => std.debug.print("[detached from {s}]\n", .{name}),
         .stolen => std.debug.print("[session {s} attached elsewhere]\n", .{name}),
+        .nested => fail(exit_runtime, "already inside session {s} (detach with C-a d to leave it)", .{name}),
         .ended => std.debug.print("[session {s} ended]\n", .{name}),
         .lost => {
             std.debug.print("[lost connection to {s}]\n", .{name});

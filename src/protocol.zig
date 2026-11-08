@@ -70,6 +70,28 @@ pub const SizePayload = struct {
     }
 };
 
+/// An attach request: the client terminal's size, and its device number,
+/// which the daemon compares with the session's own terminal.
+pub const AttachPayload = struct {
+    size: SizePayload,
+    tty_device: u64,
+
+    pub fn encode(self: AttachPayload) [12]u8 {
+        var buf: [12]u8 = undefined;
+        buf[0..4].* = self.size.encode();
+        std.mem.writeInt(u64, buf[4..12], self.tty_device, .little);
+        return buf;
+    }
+
+    pub fn decode(payload: []const u8) error{InvalidPayload}!AttachPayload {
+        if (payload.len != 12) return error.InvalidPayload;
+        return .{
+            .size = try SizePayload.decode(payload[0..4]),
+            .tty_device = std.mem.readInt(u64, payload[4..12], .little),
+        };
+    }
+};
+
 /// A terminal color as three 16-bit channels, matching the precision a
 /// terminal reports for an OSC 10/11/12 query (`rgb:RRRR/GGGG/BBBB`).
 pub const RgbPayload = struct {
@@ -225,6 +247,10 @@ test "size payload roundtrip" {
     const dec = try SizePayload.decode(&enc);
     try std.testing.expectEqual(size, dec);
     try std.testing.expectError(error.InvalidPayload, SizePayload.decode("abc"));
+
+    const request: AttachPayload = .{ .size = size, .tty_device = 0x1000_0000_0000_0042 };
+    try std.testing.expectEqual(request, try AttachPayload.decode(&request.encode()));
+    try std.testing.expectError(error.InvalidPayload, AttachPayload.decode(&enc));
 }
 
 test "rgb payload roundtrip and luminance" {

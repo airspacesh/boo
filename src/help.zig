@@ -102,7 +102,8 @@ pub const commands = [_]Entry{
         \\Attach this terminal to a session. The screen, scrollback,
         \\cursor, and title are restored from terminal state. If the
         \\session is attached elsewhere, the other client is detached
-        \\(the session is stolen).
+        \\(the session is stolen). Attaching the session you are inside
+        \\is refused.
         \\
         \\A unique prefix of the name is accepted.
         \\

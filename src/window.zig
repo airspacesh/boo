@@ -23,6 +23,9 @@ pub const Window = struct {
     /// PTY master; -1 once the child is gone.
     pty_fd: posix.fd_t,
     child_pid: posix.pid_t,
+    /// The device number of the session's terminal, which a client
+    /// running inside the session has as its own terminal.
+    tty_device: u64,
     dead: bool = false,
 
     /// The child rang the terminal bell since the daemon last serviced
@@ -99,6 +102,7 @@ pub const Window = struct {
             .alloc = alloc,
             .pty_fd = spawned.master,
             .child_pid = spawned.pid,
+            .tty_device = spawned.tty_device,
             .command_title = try alloc.dupe(u8, argv[0]),
             .last_output_ms = std.time.milliTimestamp(),
             .term = undefined,
@@ -571,6 +575,7 @@ fn testWindow(alloc: std.mem.Allocator, rows: u16, cols: u16) !*Window {
         .alloc = alloc,
         .pty_fd = -1,
         .child_pid = -1,
+        .tty_device = 0,
         .command_title = try alloc.dupe(u8, "test"),
         .last_output_ms = 0,
         .term = try vt.Terminal.init(alloc, .{
@@ -703,6 +708,7 @@ fn testWindowWithPipe(alloc: std.mem.Allocator, read_fd: *posix.fd_t) !Window {
         .alloc = alloc,
         .pty_fd = fds[1],
         .child_pid = -1,
+        .tty_device = 0,
         .command_title = "test",
         .last_output_ms = 0,
         .term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5 }),

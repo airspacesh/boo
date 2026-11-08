@@ -18,7 +18,14 @@ const log = std.log.scoped(.client);
 const enter_sequence = "\x1b[?1049h";
 const restore_sequence = window.reset_state_sequence ++ "\x1b[?1049l";
 
-pub const Outcome = enum { detached, stolen, ended, lost };
+pub const Outcome = enum {
+    detached,
+    stolen,
+    ended,
+    lost,
+    /// The client runs inside the session it asked to attach.
+    nested,
+};
 
 /// How long to wait for the terminal to answer the startup OSC 11
 /// background probe. Terminals that support it answer within a few
@@ -106,9 +113,9 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     // or resize racing a slow attach would otherwise break the
     // connection or miss the initial size.
     const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
-    try protocol.writeMsg(sock, .attach, &(protocol.SizePayload{
-        .rows = ws.row,
-        .cols = ws.col,
+    try protocol.writeMsg(sock, .attach, &(protocol.AttachPayload{
+        .size = .{ .rows = ws.row, .cols = ws.col },
+        .tty_device = try ptypkg.ttyDevice(tty),
     }).encode());
 
     // Probe the real terminal's background color so the daemon can
@@ -192,6 +199,7 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
                     .part, .output => try protocol.writeAll(1, msg.payload),
                     .detached => {
                         if (std.mem.eql(u8, msg.payload, "stolen")) return .stolen;
+                        if (std.mem.eql(u8, msg.payload, "nested")) return .nested;
                         if (std.mem.eql(u8, msg.payload, "detached-eof")) {
                             eof_guard = true;
                         }
