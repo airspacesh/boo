@@ -349,9 +349,26 @@ pub const Window = struct {
             .tabstops = true,
             .pwd = false,
             .keyboard = true,
-            .screen = .all,
+            .screen = .none,
         };
         try raw.writer.print("{f}", .{formatter});
+
+        // Scrolling-region and tabstop rehydration moved the cursor, so the
+        // cursor is placed after them. Its pen and the screen's other state
+        // come last, so the glyph that restores a pending wrap prints in
+        // its cell's own style and the default character set.
+        const screen = self.term.screens.active;
+        if (screen.cursor.pending_wrap) {
+            try self.writePendingWrap(&raw.writer);
+        } else {
+            try self.writeCursorPos(&raw.writer, screen.cursor.x, screen.cursor.y);
+        }
+        var screen_formatter: vt.formatter.ScreenFormatter = .init(screen, .{ .emit = .vt });
+        screen_formatter.content = .none;
+        screen_formatter.extra = .all;
+        screen_formatter.extra.cursor = false;
+        try raw.writer.print("{f}", .{screen_formatter});
+        try self.writeCursorShape(&raw.writer);
 
         // The formatter re-emits alternate-screen modes when the window
         // is on the alt screen, but the client canvas always shows the
@@ -366,10 +383,6 @@ pub const Window = struct {
         var filter: altscreen.Filter = .{};
         var rest = raw.writer.buffered();
         while (rest.len > 0) rest = rest[(try filter.feed(rest, &out.writer)).consumed..];
-
-        // Tabstop and scrolling-region rehydration is emitted after the
-        // screen extras and moves the cursor, so position it last.
-        try self.writeCursorPos(&out.writer);
         try out.writer.writeAll(end_sync);
 
         return alloc.dupe(u8, out.writer.buffered());
@@ -424,16 +437,53 @@ pub const Window = struct {
         return vt.Selection.init(tl, br, false);
     }
 
-    fn writeCursorPos(self: *Window, writer: *std.Io.Writer) !void {
-        const cursor = &self.term.screens.active.cursor;
-        var row: usize = cursor.y;
-        var col: usize = cursor.x;
+    fn writeCursorPos(self: *Window, writer: *std.Io.Writer, x: usize, y: usize) !void {
+        var row = y;
+        var col = x;
         // CUP is relative to the scrolling region in origin mode.
         if (self.term.modes.get(.origin)) {
             row -|= self.term.scrolling_region.top;
             col -|= self.term.scrolling_region.left;
         }
         try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+    }
+
+    /// Reprint the glyph the cursor sits on at the right margin. A cursor
+    /// position cannot express that the next character wraps first, but
+    /// printing the glyph there sets that pending wrap, as it did for the
+    /// window.
+    fn writePendingWrap(self: *Window, writer: *std.Io.Writer) !void {
+        const screen = self.term.screens.active;
+        const cursor = &screen.cursor;
+        // Under the cursor is the spacer of a wide glyph that starts a
+        // column to the left.
+        const x = if (cursor.page_cell.wide == .spacer_tail) cursor.x - 1 else cursor.x;
+        try self.writeCursorPos(writer, x, cursor.y);
+        // The formatter leaves out an empty cell, so a blank stands in.
+        if (cursor.page_cell.isEmpty()) return writer.writeAll("\x1b[0m ");
+
+        var formatter: vt.formatter.ScreenFormatter = .init(screen, .{ .emit = .vt });
+        formatter.content = .{ .selection = vt.Selection.init(
+            screen.pages.pin(.{ .active = .{ .x = x, .y = cursor.y } }).?,
+            screen.pages.pin(.{ .active = .{ .x = cursor.x, .y = cursor.y } }).?,
+            false,
+        ) };
+        try writer.print("{f}", .{formatter});
+    }
+
+    /// DECSCUSR for the cursor shape the application set. For an
+    /// application that set none, the sanitize sequence has already
+    /// restored the client terminal's default.
+    fn writeCursorShape(self: *Window, writer: *std.Io.Writer) !void {
+        if (self.stream.handler.default_cursor) return;
+        const shape: u8 = switch (self.term.screens.active.cursor.cursor_style) {
+            .block, .block_hollow => 1,
+            .underline => 3,
+            .bar => 5,
+        };
+        // Each shape's steady form is one past its blinking form.
+        const steady = !self.term.modes.get(.cursor_blinking);
+        try writer.print("\x1b[{d} q", .{shape + @intFromBool(steady)});
     }
 };
 
@@ -514,6 +564,26 @@ test "window state machine without a child" {
     try std.testing.expect(std.mem.indexOf(u8, repainted, "\x1b[") != null);
 }
 
+/// A childless window of the given size, whose output a test feeds.
+fn testWindow(alloc: std.mem.Allocator, rows: u16, cols: u16) !*Window {
+    const win = try alloc.create(Window);
+    win.* = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = -1,
+        .command_title = try alloc.dupe(u8, "test"),
+        .last_output_ms = 0,
+        .term = try vt.Terminal.init(alloc, .{
+            .cols = cols,
+            .rows = rows,
+            .max_scrollback = 512 * 1024,
+        }),
+        .stream = undefined,
+    };
+    win.stream = .initAlloc(alloc, .init(&win.term));
+    return win;
+}
+
 test "repaint reproduces the screen once output has scrolled" {
     // The shape every frame-based TUI leaves behind (Claude Code's
     // idle prompt is the motivating case): output has scrolled into
@@ -523,29 +593,14 @@ test "repaint reproduces the screen once output has scrolled" {
     // where the emulator has them, or every subsequent relative
     // redraw by the application corrupts the client's view.
     const alloc = std.testing.allocator;
-
-    var win: Window = .{
-        .alloc = alloc,
-        .pty_fd = -1,
-        .child_pid = -1,
-        .command_title = "test",
-        .last_output_ms = 0,
-        .term = try vt.Terminal.init(alloc, .{
-            .cols = 20,
-            .rows = 5,
-            .max_scrollback = 512 * 1024,
-        }),
-        .stream = undefined,
-    };
-    defer win.term.deinit(alloc);
-    var stream = win.term.vtStream();
-    defer stream.deinit();
+    const win = try testWindow(alloc, 5, 20);
+    defer win.destroy();
 
     // Eight lines scroll three into history, then a two-row frame
     // is drawn and everything below it erased: the screen is
     // L4, "boo>", and three blank rows, cursor after the "boo>".
-    stream.nextSlice("L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8");
-    stream.nextSlice("\x1b[2;1Hboo>\x1b[0J");
+    win.feed("L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8");
+    win.feed("\x1b[2;1Hboo>\x1b[0J");
 
     const bytes = try win.repaint(alloc);
     defer alloc.free(bytes);
@@ -568,6 +623,53 @@ test "repaint reproduces the screen once output has scrolled" {
     const got_cursor = canvas.screens.active.cursor;
     try std.testing.expectEqual(want_cursor.y, got_cursor.y);
     try std.testing.expectEqual(want_cursor.x, got_cursor.x);
+}
+
+test "repaint keeps the cursor's pending wrap, pen and shape" {
+    const alloc = std.testing.allocator;
+    // Each line ends at the right margin, so the next character wraps: a
+    // narrow glyph, a wide one, one in a style the pen does not keep, one
+    // the pen keeps the style of, and a blank.
+    const lines = [_][]const u8{
+        "0123456789",
+        "01234567\u{4e2d}",
+        "012345678\x1b[1;31m9\x1b[0m",
+        "\x1b[4m0123456789",
+        "\x1b[10G\x1b[42m \x1b[0m",
+    };
+    for (lines) |line| {
+        const win = try testWindow(alloc, 5, 10);
+        defer win.destroy();
+        win.feed("\x1b[6 q");
+        win.feed(line);
+        try std.testing.expect(win.term.screens.active.cursor.pending_wrap);
+
+        const bytes = try win.repaint(alloc);
+        defer alloc.free(bytes);
+        var canvas = try vt.Terminal.init(alloc, .{ .cols = 10, .rows = 5 });
+        defer canvas.deinit(alloc);
+        var canvas_stream = canvas.vtStream();
+        defer canvas_stream.deinit();
+        canvas_stream.nextSlice(bytes);
+
+        const want = win.term.screens.active.cursor;
+        const got = canvas.screens.active.cursor;
+        try std.testing.expect(got.pending_wrap);
+        try std.testing.expect(got.style.eql(want.style));
+        try std.testing.expectEqual(vt.CursorStyle.bar, got.cursor_style);
+        try std.testing.expect(!canvas.modes.get(.cursor_blinking));
+
+        // The next character wraps onto the next row on both.
+        win.feed("X");
+        canvas_stream.nextSlice("X");
+        const want_text = try win.term.plainString(alloc);
+        defer alloc.free(want_text);
+        const got_text = try canvas.plainString(alloc);
+        defer alloc.free(got_text);
+        try std.testing.expectEqualStrings(want_text, got_text);
+        try std.testing.expectEqual(win.term.screens.active.cursor.x, canvas.screens.active.cursor.x);
+        try std.testing.expectEqual(win.term.screens.active.cursor.y, canvas.screens.active.cursor.y);
+    }
 }
 
 test "title set via OSC is tracked and emitted sanitized" {
