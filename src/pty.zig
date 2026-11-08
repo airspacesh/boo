@@ -129,6 +129,16 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
         // Child. Become a session leader and acquire the inherited
         // PTY slave as the controlling terminal (login_tty pattern).
         _ = posix.setsid() catch posix.exit(127);
+        // The daemon ignores SIGHUP and SIGPIPE, and exec keeps a signal
+        // ignored. Restore the defaults, so a hangup ends the session's
+        // processes and a pipeline's writer stops when its reader exits.
+        const default: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.DFL },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &default, null);
+        posix.sigaction(posix.SIG.PIPE, &default, null);
         if (ioctl(pty.slave, Tio.IOCSCTTY, @as(c_ulong, 0)) != 0) posix.exit(127);
 
         posix.dup2(pty.slave, 0) catch posix.exit(127);

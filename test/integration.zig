@@ -1851,6 +1851,27 @@ test "rename: moves a session to a new name" {
     try h.runExit(&.{ "rename", "after" }, 2);
 }
 
+test "session commands start with default SIGHUP and SIGPIPE handling" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Each inner shell signals itself. With the default disposition the
+    // signal ends it before the echo. An inherited SIG_IGN lets it print.
+    // The markers are computed, because the outer shell reports a killed
+    // command by quoting its source.
+    try h.startDetached("sigs", &.{
+        "sh",
+        "-c",
+        "sh -c 'kill -HUP $$; echo $((40+2))-HUP'; " ++
+            "sh -c 'kill -PIPE $$; echo $((40+2))-PIPE'; " ++
+            "echo SIGNALS-CHECKED; exec cat",
+    });
+    const screen = try h.waitPeekContains("sigs", "SIGNALS-CHECKED");
+    defer alloc.free(screen);
+    try std.testing.expect(std.mem.indexOf(u8, screen, "42-") == null);
+}
+
 /// Stand in for a live daemon that refuses connections, as one does
 /// between bind and listen or with a full backlog. Holds the session's
 /// lock (see src/claim.zig) and binds its socket without listening.
