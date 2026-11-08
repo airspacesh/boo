@@ -1396,6 +1396,8 @@ test "ls emits machine-readable JSON" {
         try std.testing.expectEqual(@as(i64, -1), obj.get("bell_idle_ms").?.integer);
         // No client is attached.
         try std.testing.expectEqual(std.json.Value.null, obj.get("client").?);
+        // cat reports no program status.
+        try std.testing.expectEqual(std.json.Value.null, obj.get("status").?);
         // The pid names the running cat.
         const pid: std.posix.pid_t = @intCast(obj.get("pid").?.integer);
         try std.posix.kill(pid, 0);
@@ -2597,5 +2599,184 @@ test "switch moves a client between sessions, and C-a L brings it back" {
 
     try client.send("\x01d");
     try client.waitFor("detached from left");
+    try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
+}
+
+/// Poll `ls --json` until the session's program status has the state
+/// `want`, or until it has none when `want` is null.
+fn waitStatus(h: *Harness, session: []const u8, want: ?[]const u8) !void {
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        const ls = try h.run(&.{ "ls", "--json" });
+        defer h.alloc.free(ls.stdout);
+        defer h.alloc.free(ls.stderr);
+        var parsed = try std.json.parseFromSlice(std.json.Value, h.alloc, ls.stdout, .{});
+        defer parsed.deinit();
+        for (parsed.value.array.items) |item| {
+            const obj = item.object;
+            if (!std.mem.eql(u8, obj.get("name").?.string, session)) continue;
+            const state: ?[]const u8 = switch (obj.get("status").?) {
+                .object => |status| status.get("state").?.string,
+                else => null,
+            };
+            if (want == null and state == null) return;
+            if (want != null and state != null and std.mem.eql(u8, want.?, state.?)) return;
+        }
+        deadline.tick("session status never reached the wanted state") catch |err| {
+            std.debug.print("--- last ls --json ---\n{s}\n---\n", .{ls.stdout});
+            return err;
+        };
+    }
+}
+
+test "program status: pane answers the query, lists the status, and gives it to the client terminal" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Once attached, ask for support, then report being blocked on a
+    // question ("Pick one" in base64). The test terminal never answers
+    // the query, so only the daemon can unblock the read.
+    const go_path = try std.fmt.allocPrint(alloc, "{s}/go", .{h.dir});
+    defer alloc.free(go_path);
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "while [ ! -e {s} ]; do sleep 0.02; done; " ++
+            "printf '\\033]7501;?\\033\\\\'; " ++
+            "IFS= read -rs -d '\\' reply; " ++
+            "printf 'STATUS-%s\\n' ANSWERED; " ++
+            "printf '\\033]7501;state=blocked:kind=question:msg=UGljayBvbmU=\\033\\\\'; " ++
+            "sleep 30",
+        .{go_path},
+    );
+    defer alloc.free(script);
+
+    var client = try PtyClient.spawn(&h, &.{ "new", "st", "--", "bash", "-c", script }, 24, 80);
+    defer client.deinit();
+    try h.waitSessionUp("st");
+    try client.waitFor("\x1b[H\x1b[2J");
+
+    try h.touch("go");
+    try client.waitFor("STATUS-ANSWERED");
+    // The query is the daemon's to answer, so it never reaches the
+    // client terminal, which would answer it a second time.
+    try std.testing.expect(std.mem.indexOf(u8, client.output.items, "\x1b]7501;?") == null);
+    // The report itself passes through.
+    const report = "\x1b]7501;state=blocked:kind=question:msg=UGljayBvbmU=\x1b\\";
+    try client.waitFor(report);
+
+    try waitStatus(&h, "st", "blocked");
+    {
+        const ls = try h.run(&.{ "ls", "--json" });
+        defer alloc.free(ls.stdout);
+        defer alloc.free(ls.stderr);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, ls.stdout, .{});
+        defer parsed.deinit();
+        const status = parsed.value.array.items[0].object.get("status").?.object;
+        try std.testing.expectEqualStrings("question", status.get("kind").?.string);
+        try std.testing.expectEqualStrings("Pick one", status.get("msg").?.string);
+        try std.testing.expect(status.get("app") == null);
+    }
+    {
+        const ls = try h.run(&.{"ls"});
+        defer alloc.free(ls.stdout);
+        defer alloc.free(ls.stderr);
+        try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "STATUS") != null);
+        try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "blocked") != null);
+    }
+
+    // Detaching takes the status off the client terminal.
+    client.clearOutput();
+    try client.send("\x01d");
+    try client.waitFor("detached from st");
+    try std.testing.expect(std.mem.indexOf(u8, client.output.items, "\x1b]7501;state=clear\x1b\\") != null);
+    _ = try client.waitExit();
+
+    // Reattaching gives it back.
+    var again = try PtyClient.spawn(&h, &.{ "attach", "st" }, 24, 80);
+    defer again.deinit();
+    try again.waitFor(report);
+}
+
+test "program status: reports with an id, clear, and a full reset" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("lt", &.{"sh"});
+    try h.sendLine("lt", "printf '\\033]7501;state=working\\007'");
+    try waitStatus(&h, "lt", "working");
+
+    // A report about part of the work leaves the program's status alone,
+    // even a clear. The marker shows both were processed.
+    try h.sendLine("lt", "printf '\\033]7501;state=done:id=build\\007\\033]7501;state=clear:id=build\\007ID-%s\\n' DONE");
+    const peek = try h.waitPeekContains("lt", "ID-DONE");
+    alloc.free(peek);
+    try waitStatus(&h, "lt", "working");
+
+    try h.sendLine("lt", "printf '\\033]7501;state=clear\\007'");
+    try waitStatus(&h, "lt", null);
+
+    try h.sendLine("lt", "printf '\\033]7501;state=error\\007'");
+    try waitStatus(&h, "lt", "error");
+    try h.sendLine("lt", "printf '\\033c'");
+    try waitStatus(&h, "lt", null);
+}
+
+test "C-a m lists the sessions, Esc cancels, and Enter switches to the one picked" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Listed by name, so the menu shows apple, banana, cherry.
+    try h.startDetached("banana", &.{"cat"});
+    try h.startDetached("apple", &.{"cat"});
+    try h.startDetached("cherry", &.{"cat"});
+    try h.sendLine("apple", "apple-screen");
+    try h.sendLine("banana", "banana-screen");
+    alloc.free(try h.waitPeekContains("apple", "apple-screen"));
+    alloc.free(try h.waitPeekContains("banana", "banana-screen"));
+
+    var client = try PtyClient.spawn(&h, &.{ "attach", "apple" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("apple-screen");
+
+    client.clearOutput();
+    try client.send("\x01m");
+    try client.waitFor("Esc cancels");
+    for ([_][]const u8{ "NAME", "apple", "banana", "cherry" }) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, client.output.items, name) != null);
+    }
+    // The cursor starts on the session the client shows.
+    try std.testing.expect(std.mem.indexOf(u8, client.output.items, "\x1b[7mapple") != null);
+
+    // Esc gives the canvas back to the session.
+    client.clearOutput();
+    try client.send("\x1b");
+    try client.waitFor("apple-screen");
+    try client.send("typed-into-apple\r");
+    alloc.free(try h.waitPeekContains("apple", "typed-into-apple"));
+
+    // Down a row and Enter switches to banana.
+    client.clearOutput();
+    try client.send("\x01m");
+    try client.waitFor("Esc cancels");
+    client.clearOutput();
+    try client.send("j");
+    try client.waitFor("\x1b[7mbanana");
+    try client.send("\r");
+    try client.waitFor("switched to banana");
+    try client.waitFor("banana-screen");
+    try std.testing.expectEqual(null, try sessionClient(&h, "apple"));
+    const tty = (try sessionClient(&h, "banana")).?;
+    alloc.free(tty);
+
+    // C-a L returns to the session the menu switched from.
+    client.clearOutput();
+    try client.send("\x01L");
+    try client.waitFor("switched to apple");
+
+    try client.send("\x01d");
+    try client.waitFor("detached from apple");
     try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
 }

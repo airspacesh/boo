@@ -10,6 +10,7 @@ const daemonpkg = @import("daemon.zig");
 const help = @import("help.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
+const sessions = @import("sessions.zig");
 
 pub const version = "0.7.0";
 
@@ -159,18 +160,18 @@ fn resolvePrefix(
     dir: []const u8,
     want: []const u8,
 ) ![]u8 {
-    const sessions = try paths.listSessions(alloc, dir);
+    const names = try paths.listSessions(alloc, dir);
     defer {
-        for (sessions) |s| alloc.free(s);
-        alloc.free(sessions);
+        for (names) |s| alloc.free(s);
+        alloc.free(names);
     }
 
-    for (sessions) |s| {
+    for (names) |s| {
         if (std.mem.eql(u8, s, want)) return alloc.dupe(u8, s);
     }
     var matches: std.ArrayList([]u8) = .empty;
     defer matches.deinit(alloc);
-    for (sessions) |s| {
+    for (names) |s| {
         if (std.mem.startsWith(u8, s, want)) try matches.append(alloc, s);
     }
     if (matches.items.len == 1) return alloc.dupe(u8, matches.items[0]);
@@ -204,111 +205,6 @@ fn requireSession(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !
         fail(exit_no_session, "no session named {s} (run 'pane ls')", .{name});
 }
 
-pub const SessionInfo = struct {
-    /// Full info payload: name \t Attached|Detached \t idle_ms \t
-    /// out_idle_ms \t unread \t bell_idle_ms \t pid \t client \t title.
-    text: []u8,
-    attached: bool,
-    idle_ms: i64,
-    /// Time since the window last produced output; drives wait --idle.
-    out_idle_ms: i64,
-    /// Output arrived while no client was attached.
-    unread: bool,
-    /// Milliseconds since the last bell that rang while you were away,
-    /// or -1 for none. A bell is an explicit "your turn" request.
-    bell_idle_ms: i64,
-    /// The session command's pid, or -1 once it has exited.
-    pid: posix.pid_t,
-    /// The path of the attached client's terminal, empty when none is
-    /// attached; slices into `text`.
-    client: []const u8,
-    /// Window title; slices into `text`.
-    title: []const u8,
-};
-
-/// What a session's daemon did with a control command.
-const ControlReply = union(enum) {
-    result: client.ControlResult,
-    /// The daemon holds the session's name but did not take the command
-    /// in time.
-    busy,
-    /// No daemon holds the name, and its socket, if any, is deleted.
-    gone,
-};
-
-/// Run a control command against a session, telling a daemon that is
-/// gone from one that is slow. A non-null `timeout_ms` bounds the round
-/// trip so a slow daemon cannot hang the caller.
-fn controlSession(
-    alloc: std.mem.Allocator,
-    dir: []const u8,
-    name: []const u8,
-    argv: []const []const u8,
-    timeout_ms: ?u32,
-) !ControlReply {
-    const sock = try paths.socketPath(alloc, dir, name);
-    defer alloc.free(sock);
-    const result = client.control(alloc, sock, argv, timeout_ms) catch |err| switch (err) {
-        error.Timeout => return .busy,
-        // A daemon refuses connections while its backlog is full, and an
-        // EOF may mean it died before replying, so only a free lock shows
-        // that it is gone.
-        error.FileNotFound, error.ConnectionRefused, error.ConnectionLost => {
-            const stale = try claimpkg.removeStale(alloc, dir, name);
-            return if (stale) .gone else .busy;
-        },
-        else => return err,
-    };
-    return .{ .result = result };
-}
-
-/// What a session's daemon said when asked for its info.
-pub const InfoReply = union(enum) {
-    info: SessionInfo,
-    busy,
-    gone,
-};
-
-/// Query a session daemon, deleting the socket when the daemon is gone.
-pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, timeout_ms: u32) !InfoReply {
-    const result = switch (try controlSession(alloc, dir, name, &.{"info"}, timeout_ms)) {
-        .result => |result| result,
-        .busy => return .busy,
-        .gone => return .gone,
-    };
-    errdefer alloc.free(result.text);
-    if (!result.ok) return error.BadResponse;
-
-    var it = std.mem.splitScalar(u8, result.text, '\t');
-    _ = it.next() orelse return error.BadResponse; // name
-    const attached = std.mem.eql(u8, it.next() orelse return error.BadResponse, "Attached");
-    const idle_ms = std.fmt.parseInt(i64, it.next() orelse return error.BadResponse, 10) catch
-        return error.BadResponse;
-    const out_idle_ms = std.fmt.parseInt(i64, it.next() orelse return error.BadResponse, 10) catch
-        return error.BadResponse;
-    const unread = std.mem.eql(u8, it.next() orelse return error.BadResponse, "1");
-    const bell_idle_ms = std.fmt.parseInt(i64, it.next() orelse return error.BadResponse, 10) catch
-        return error.BadResponse;
-    const pid = std.fmt.parseInt(posix.pid_t, it.next() orelse return error.BadResponse, 10) catch
-        return error.BadResponse;
-    const client_tty = it.next() orelse return error.BadResponse;
-    return .{
-        .info = .{
-            .text = result.text,
-            .attached = attached,
-            .idle_ms = idle_ms,
-            .out_idle_ms = out_idle_ms,
-            .unread = unread,
-            .bell_idle_ms = bell_idle_ms,
-            .pid = pid,
-            .client = client_tty,
-            // The daemon strips control bytes from the title, so it holds no
-            // tab and runs to the end of the payload.
-            .title = it.rest(),
-        },
-    };
-}
-
 /// Run a control command against a session, mapping a missing or
 /// mid-teardown daemon to the documented exit code.
 fn mustControl(
@@ -317,7 +213,7 @@ fn mustControl(
     name: []const u8,
     argv: []const []const u8,
 ) !client.ControlResult {
-    return switch (try controlSession(alloc, dir, name, argv, null)) {
+    return switch (try sessions.controlSession(alloc, dir, name, argv, null)) {
         .result => |result| result,
         .busy => fail(exit_runtime, "session {s} is not accepting connections; try again", .{name}),
         .gone => fail(exit_no_session, "no session named {s}", .{name}),
@@ -486,9 +382,35 @@ fn attachLoop(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void
     }
 }
 
-/// How long `ls` waits for each session's daemon before listing the
-/// session as busy.
-const ls_timeout_ms = 1000;
+/// The report as a JSON object holding the keys the program sent, with
+/// `title` and `msg` decoded.
+fn appendStatusJson(alloc: std.mem.Allocator, out: *std.ArrayList(u8), report: sessions.StatusReport) !void {
+    try out.appendSlice(alloc, "{\"state\":");
+    try appendJsonString(alloc, out, @tagName(report.state));
+    if (report.readOption(.kind)) |kind| {
+        try out.appendSlice(alloc, ",\"kind\":");
+        try appendJsonString(alloc, out, @tagName(kind));
+    }
+    if (report.readOption(.progress)) |progress| {
+        const field = try std.fmt.allocPrint(alloc, ",\"progress\":{d}", .{progress});
+        defer alloc.free(field);
+        try out.appendSlice(alloc, field);
+    }
+    if (report.readOption(.app)) |app| {
+        try out.appendSlice(alloc, ",\"app\":");
+        try appendJsonString(alloc, out, app);
+    }
+    inline for (.{ .title, .msg }) |option| {
+        if (report.readOption(option) != null) {
+            var text: std.Io.Writer.Allocating = .init(alloc);
+            defer text.deinit();
+            try report.writeText(option, &text.writer);
+            try out.appendSlice(alloc, ",\"" ++ @tagName(option) ++ "\":");
+            try appendJsonString(alloc, out, text.written());
+        }
+    }
+    try out.append(alloc, '}');
+}
 
 fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var json = false;
@@ -503,34 +425,15 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try socketDir(alloc);
     defer alloc.free(dir);
-    const sessions = try paths.listSessions(alloc, dir);
-    defer {
-        for (sessions) |s| alloc.free(s);
-        alloc.free(sessions);
-    }
+    var listing: sessions.Listing = try .init(alloc, dir);
+    defer listing.deinit();
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
-    var name_width: usize = 4;
-    var replies: std.ArrayList(struct { name: []const u8, reply: InfoReply }) = .empty;
-    defer {
-        for (replies.items) |entry| switch (entry.reply) {
-            .info => |info| alloc.free(info.text),
-            .busy, .gone => {},
-        };
-        replies.deinit(alloc);
-    }
-    for (sessions) |name| {
-        const reply = sessionInfo(alloc, dir, name, ls_timeout_ms) catch continue;
-        if (reply == .gone) continue;
-        try replies.append(alloc, .{ .name = name, .reply = reply });
-        name_width = @max(name_width, name.len);
-    }
-
     if (json) {
         try out.append(alloc, '[');
-        for (replies.items, 0..) |entry, i| {
+        for (listing.entries, 0..) |entry, i| {
             if (i > 0) try out.append(alloc, ',');
             try out.appendSlice(alloc, "{\"name\":");
             try appendJsonString(alloc, &out, entry.name);
@@ -558,32 +461,27 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             } else {
                 try out.appendSlice(alloc, "null");
             }
+            try out.appendSlice(alloc, ",\"status\":");
+            if (listing.status(info)) |report| {
+                try appendStatusJson(alloc, &out, report);
+            } else {
+                try out.appendSlice(alloc, "null");
+            }
             try out.append(alloc, '}');
         }
         try out.appendSlice(alloc, "]\n");
         return stdoutWrite(out.items);
     }
 
-    if (replies.items.len == 0) {
+    if (listing.entries.len == 0) {
         return stdoutPrint(alloc, "No sessions in {s}.\n", .{dir});
     }
 
-    try appendPadded(alloc, &out, "NAME", name_width);
-    try out.appendSlice(alloc, "  STATE     IDLE  TITLE\n");
-    for (replies.items) |entry| {
-        try appendPadded(alloc, &out, entry.name, name_width);
-        var idle_buf: [32]u8 = undefined;
-        const line = switch (entry.reply) {
-            .info => |info| try std.fmt.allocPrint(alloc, "  {s: <8}  {s: <4}  {s}\n", .{
-                if (info.attached) "attached" else "detached",
-                fmtIdle(&idle_buf, info.idle_ms),
-                info.title,
-            }),
-            .busy => try alloc.dupe(u8, "  busy      -\n"),
-            .gone => unreachable,
-        };
-        defer alloc.free(line);
-        try out.appendSlice(alloc, line);
+    try listing.appendHeader(&out);
+    try out.append(alloc, '\n');
+    for (listing.entries) |entry| {
+        try listing.appendRow(&out, entry);
+        try out.append(alloc, '\n');
     }
     try stdoutWrite(out.items);
 }
@@ -851,7 +749,7 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         const remaining_ms = @max(deadline - std.time.milliTimestamp(), 1);
         const call_timeout_ms: u32 = @intCast(@min(remaining_ms, std.math.maxInt(u32)));
         const met = if (text) |needle| met: {
-            const result = switch (try controlSession(alloc, dir, name, &.{ "peek", "screen" }, call_timeout_ms)) {
+            const result = switch (try sessions.controlSession(alloc, dir, name, &.{ "peek", "screen" }, call_timeout_ms)) {
                 .result => |result| result,
                 .busy => break :met false,
                 .gone => fail(exit_no_session, "no session named {s}", .{name}),
@@ -861,7 +759,7 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             const peek = parsePeek(result.text) orelse
                 fail(exit_runtime, "malformed peek response", .{});
             break :met std.mem.indexOf(u8, peek.screen, needle) != null;
-        } else switch (try sessionInfo(alloc, dir, name, call_timeout_ms)) {
+        } else switch (try sessions.sessionInfo(alloc, dir, name, call_timeout_ms)) {
             .info => |info| met: {
                 defer alloc.free(info.text);
                 break :met info.out_idle_ms >= idle_settle_ms;
@@ -900,13 +798,13 @@ fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer alloc.free(dir);
 
     if (all) {
-        const sessions = try paths.listSessions(alloc, dir);
+        const names = try paths.listSessions(alloc, dir);
         defer {
-            for (sessions) |s| alloc.free(s);
-            alloc.free(sessions);
+            for (names) |s| alloc.free(s);
+            alloc.free(names);
         }
-        for (sessions) |name| {
-            const reply = controlSession(alloc, dir, name, &.{"quit"}, null) catch continue;
+        for (names) |name| {
+            const reply = sessions.controlSession(alloc, dir, name, &.{"quit"}, null) catch continue;
             switch (reply) {
                 .result => |result| alloc.free(result.text),
                 .busy, .gone => continue,
@@ -993,22 +891,17 @@ fn clientSession(alloc: std.mem.Allocator, dir: []const u8, client_name: []const
         return alloc.dupe(u8, client_name);
     }
 
-    const sessions = try paths.listSessions(alloc, dir);
-    defer {
-        for (sessions) |s| alloc.free(s);
-        alloc.free(sessions);
-    }
-    for (sessions) |name| {
-        const reply = sessionInfo(alloc, dir, name, ls_timeout_ms) catch continue;
-        const info = switch (reply) {
+    var listing: sessions.Listing = try .init(alloc, dir);
+    defer listing.deinit();
+    for (listing.entries) |entry| {
+        const info = switch (entry.reply) {
             .info => |info| info,
             .busy, .gone => continue,
         };
-        defer alloc.free(info.text);
         const tty = info.client;
         const on_tty = std.mem.eql(u8, tty, client_name) or
             (std.mem.startsWith(u8, tty, "/dev/") and std.mem.eql(u8, tty["/dev/".len..], client_name));
-        if (info.attached and on_tty) return alloc.dupe(u8, name);
+        if (info.attached and on_tty) return alloc.dupe(u8, entry.name);
     }
     fail(exit_runtime, "no client on terminal {s} (run 'pane ls --json' to see clients)", .{client_name});
 }
@@ -1040,17 +933,6 @@ fn cmdHelp(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 }
 
 // -- Output helpers -------------------------------------------------------
-
-fn appendPadded(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    text: []const u8,
-    width: usize,
-) !void {
-    try out.appendSlice(alloc, text);
-    var i = text.len;
-    while (i < width) : (i += 1) try out.append(alloc, ' ');
-}
 
 /// Append a JSON string literal, escaping per RFC 8259.
 fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
@@ -1096,14 +978,6 @@ fn parseDurationMs(s: []const u8) ?u64 {
         }
     }
     return null;
-}
-
-/// Human idle durations for `ls`: 12s, 5m, 3h.
-fn fmtIdle(buf: []u8, ms: i64) []const u8 {
-    const s = @divTrunc(@max(0, ms), std.time.ms_per_s);
-    if (s < 60) return std.fmt.bufPrint(buf, "{d}s", .{s}) catch "?";
-    if (s < 3600) return std.fmt.bufPrint(buf, "{d}m", .{@divTrunc(s, 60)}) catch "?";
-    return std.fmt.bufPrint(buf, "{d}h", .{@divTrunc(s, 3600)}) catch "?";
 }
 
 // -- Daemon plumbing ------------------------------------------------------
@@ -1210,14 +1084,6 @@ test "parsePeek" {
     try std.testing.expectEqualStrings("line1\nline2", peek.screen);
 }
 
-test "fmtIdle" {
-    var buf: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("0s", fmtIdle(&buf, 400));
-    try std.testing.expectEqualStrings("12s", fmtIdle(&buf, 12_500));
-    try std.testing.expectEqualStrings("5m", fmtIdle(&buf, 5 * 60_000));
-    try std.testing.expectEqualStrings("2h", fmtIdle(&buf, 2 * 3_600_000));
-}
-
 test {
     _ = @import("protocol.zig");
     _ = @import("paths.zig");
@@ -1227,6 +1093,8 @@ test {
     _ = @import("reap.zig");
     _ = @import("altscreen.zig");
     _ = @import("oscquery.zig");
+    _ = @import("sessions.zig");
+    _ = @import("menu.zig");
     _ = @import("window.zig");
     _ = @import("daemon.zig");
     _ = @import("client.zig");

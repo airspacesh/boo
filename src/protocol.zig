@@ -22,6 +22,9 @@ pub const MsgType = enum(u8) {
     resize = 3,
     detach_req = 4,
     command = 5,
+    /// The client closed the session menu without switching, so the
+    /// session's canvas needs a frame again.
+    close_menu = 6,
     /// The background color of the client's real terminal, as a
     /// `RgbPayload`. The client probes its terminal once at startup and
     /// reports the answer so the daemon can satisfy OSC 11 background
@@ -46,6 +49,9 @@ pub const MsgType = enum(u8) {
     switch_to = 70,
     /// Attach the session this client switched from, as `C-a L` asked.
     switch_back = 71,
+    /// Open the session menu, as `C-a m` asked. The canvas is the
+    /// client's until it closes the menu or switches away.
+    menu = 72,
     _,
 };
 

@@ -48,6 +48,8 @@ pub const Command = union(enum) {
     detach: u8,
     redraw,
     copy_mode,
+    /// Open the menu of sessions to switch to.
+    menu,
     /// Return to the session the client switched from.
     switch_back,
     unknown: u8,
@@ -308,6 +310,7 @@ pub const Parser = struct {
             'd', 0x04 => try handler.command(.{ .detach = byte }),
             'l', 0x0c => try handler.command(.redraw),
             0x1b, '[' => try handler.command(.copy_mode),
+            'm' => try handler.command(.menu),
             'L' => try handler.command(.switch_back),
             'a' => try handler.command(.{ .forward = &.{escape_byte} }),
             else => try handler.command(.{ .unknown = byte }),
@@ -849,4 +852,15 @@ test "modify: kitty and modify decode side by side" {
     try p.feed("\x1b[97;5u\x1b[27;5;100~", both, &h);
     try std.testing.expectEqual(Command{ .detach = 0x04 }, h.cmds.items[1]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "C-a m opens the session menu, also as kitty keys" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{};
+    try p.feed("\x01m", .{}, &h);
+    try p.feed("\x1b[97;5u\x1b[109u", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 2), h.cmds.items.len);
+    try std.testing.expectEqual(Command.menu, h.cmds.items[0]);
+    try std.testing.expectEqual(Command.menu, h.cmds.items[1]);
 }

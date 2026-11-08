@@ -82,14 +82,25 @@ const View = enum {
     torn,
 };
 
+/// What an attached client's canvas shows.
+const Mode = enum {
+    /// The window, with its output passing through.
+    live,
+    /// Copy mode, a view of the window's history that its keys scroll.
+    copy,
+    /// The session menu, which the client draws and drives itself until
+    /// it closes the menu or switches away.
+    menu,
+};
+
 const Conn = struct {
     alloc: std.mem.Allocator,
     fd: posix.fd_t,
     decoder: protocol.Decoder,
     attached: bool = false,
-    /// The attached client is in copy mode. Output stops passing through
-    /// to it, and its keys scroll a view of the window's history.
-    copy_mode: bool = false,
+    /// Output passes through to the attached client only while it is
+    /// live.
+    mode: Mode = .live,
     view: View = .current,
     /// The connection is finished: its fd is dead or it was dropped.
     /// `sweep` closes the fd and frees it.
@@ -519,6 +530,9 @@ pub const Daemon = struct {
                 if (!conn.attached) return;
                 self.last_activity_ms = std.time.milliTimestamp();
                 self.key_input_timer.reset();
+                // Keys typed before the client learned the menu was open
+                // belong to neither the menu nor the window.
+                if (conn.mode == .menu) return;
                 // The first key after the notice has been up a while
                 // clears it, with a repaint of what it covered.
                 if (conn.switch_notice_since_ms) |since_ms| if (monotonicMs() - since_ms >= switch_notice_ms) {
@@ -529,7 +543,7 @@ pub const Daemon = struct {
                 // or modifyOtherKeys, the client's terminal mirrors
                 // it and sends the prefix key encoded.
                 // A copy mode frame resets the client's keyboard modes.
-                const prot: keys.Protocols = if (conn.copy_mode) .{} else if (self.liveWindow()) |w| .{
+                const prot: keys.Protocols = if (conn.mode == .copy) .{} else if (self.liveWindow()) |w| .{
                     .kitty = w.kittyKeysActive(),
                     .modify = w.modifyKeysActive(),
                 } else .{};
@@ -551,6 +565,13 @@ pub const Daemon = struct {
                 self.detachConn(conn, "detached");
             },
 
+            .close_menu => {
+                if (conn.mode != .menu) return;
+                conn.mode = .live;
+                self.updatePassthrough();
+                conn.view = .stale;
+            },
+
             .command => try self.handleCommand(conn, msg.payload),
 
             else => {},
@@ -566,7 +587,7 @@ pub const Daemon = struct {
         if (!conn.attached) return;
         switch (cmd) {
             .forward => |bytes| {
-                const window_bytes = if (conn.copy_mode) self.copyModeInput(conn, bytes) else bytes;
+                const window_bytes = if (conn.mode == .copy) self.copyModeInput(conn, bytes) else bytes;
                 if (self.liveWindow()) |w| w.writeInput(window_bytes) catch {};
             },
             .detach => |byte| self.detachConn(
@@ -577,6 +598,7 @@ pub const Daemon = struct {
             ),
             .redraw => conn.view = .stale,
             .copy_mode => self.enterCopyMode(conn),
+            .menu => self.openMenu(conn),
             .switch_back => conn.send(.switch_back, ""),
             .unknown => |byte| if (std.ascii.isPrint(byte))
                 self.message(conn, "unknown key: ^A {c}", .{byte})
@@ -683,7 +705,7 @@ pub const Daemon = struct {
             const pid: posix.pid_t = if (self.liveWindow()) |w| w.child_pid else -1;
             var out: std.Io.Writer.Allocating = .init(self.alloc);
             defer out.deinit();
-            try out.writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{s}\t", .{
+            try out.writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{s}\t{s}\t", .{
                 self.opts.name,
                 if (viewer != null) "Attached" else "Detached",
                 idle,
@@ -694,6 +716,10 @@ pub const Daemon = struct {
                 // Empty when no client is attached. A terminal path holds
                 // no tab.
                 if (viewer) |v| v.tty_name else "",
+                // The program status report's body, empty for none. The
+                // terminal parser drops control bytes inside an OSC, so it
+                // holds no tab.
+                if (self.liveWindow()) |w| w.status else "",
             });
             // Window title last; sanitized, so it cannot contain the
             // tabs that separate the fields.
@@ -804,17 +830,17 @@ pub const Daemon = struct {
         const detached = self.attachedConn() == null;
         if (detached) self.unread = true;
 
-        // Strip OSC 11 background queries up front and answer them from
-        // the reported terminal background. They must not also reach an
-        // attached client's real terminal, which would answer them a
-        // second time, so this runs before any passthrough forwarding.
+        // Strip the queries the daemon answers up front and answer them.
+        // They must not also reach an attached client's real terminal,
+        // which would answer them a second time, so this runs before any
+        // passthrough forwarding.
         // The filter only removes bytes, so the cleaned copy never
         // outgrows the chunk; on the impossible overflow, fall back to
         // the raw chunk rather than dropping output.
         var clean_buf: [32 * 1024]u8 = undefined;
         var clean_writer = std.Io.Writer.fixed(&clean_buf);
         const cleaned = cleaned: {
-            win.filterColorQueries(chunk, &clean_writer) catch break :cleaned chunk;
+            win.filterQueries(chunk, &clean_writer) catch break :cleaned chunk;
             break :cleaned clean_writer.buffered();
         };
 
@@ -827,7 +853,7 @@ pub const Daemon = struct {
             // viewport stays on the rows it shows, but the tag's counts
             // change, and the history may drop those rows.
             const viewer = self.attachedConn() orelse return;
-            if (viewer.copy_mode) viewer.view = .stale;
+            if (viewer.mode == .copy) viewer.view = .stale;
             return;
         };
 
@@ -931,7 +957,7 @@ pub const Daemon = struct {
     }
 
     fn updatePassthrough(self: *Daemon) void {
-        const passing = if (self.attachedConn()) |conn| !conn.copy_mode else false;
+        const passing = if (self.attachedConn()) |conn| conn.mode == .live else false;
         if (self.liveWindow()) |w| w.passthrough = passing;
     }
 
@@ -953,7 +979,7 @@ pub const Daemon = struct {
     fn enterCopyMode(self: *Daemon, conn: *Conn) void {
         const win = self.liveWindow() orelse return;
         win.term.scrollViewport(.bottom);
-        conn.copy_mode = true;
+        conn.mode = .copy;
         self.updatePassthrough();
         conn.view = .stale;
     }
@@ -961,9 +987,18 @@ pub const Daemon = struct {
     fn leaveCopyMode(self: *Daemon, conn: *Conn) void {
         const win = self.liveWindow() orelse return;
         win.term.scrollViewport(.bottom);
-        conn.copy_mode = false;
+        conn.mode = .live;
         self.updatePassthrough();
         conn.view = .stale;
+    }
+
+    /// Hand the canvas to the client's session menu. The window stops
+    /// passing output through, and the client gets no frames until it
+    /// closes the menu.
+    fn openMenu(self: *Daemon, conn: *Conn) void {
+        conn.mode = .menu;
+        self.updatePassthrough();
+        conn.send(.menu, "");
     }
 
     /// Scroll copy mode's view by the keys in `input`. Returns the bytes
@@ -996,10 +1031,11 @@ pub const Daemon = struct {
             .torn => if (!win.atGround()) return,
         }
 
-        const bytes = (if (conn.copy_mode)
-            win.copyModeFrame(self.alloc)
-        else
-            win.repaint(self.alloc)) catch |err| {
+        const bytes = (switch (conn.mode) {
+            .live => win.repaint(self.alloc),
+            .copy => win.copyModeFrame(self.alloc),
+            .menu => return,
+        }) catch |err| {
             log.warn("rendering a frame for the client failed: {}", .{err});
             return;
         };
@@ -1009,7 +1045,7 @@ pub const Daemon = struct {
         win.alt_filter.reset();
         conn.view = if (win.atGround()) .current else .torn;
         conn.send(.output, bytes);
-        if (!conn.copy_mode and conn.switch_notice_since_ms != null) {
+        if (conn.mode == .live and conn.switch_notice_since_ms != null) {
             self.message(conn, "switched to {s}", .{self.opts.name});
         }
     }

@@ -9,15 +9,17 @@ const ptypkg = @import("pty.zig");
 const window = @import("window.zig");
 const keys = @import("keys.zig");
 const paths = @import("paths.zig");
+const Menu = @import("menu.zig").Menu;
 
 const log = std.log.scoped(.client);
 
 /// The attached client renders inside the terminal's own alternate
 /// screen (like screen and tmux), so detaching restores the user's
 /// pre-attach shell view. `1049h` also saves the cursor, which the
-/// final `1049l` restores after undoing any state the session set.
+/// final `1049l` restores after undoing any state the session set,
+/// including the program status it reported.
 const enter_sequence = "\x1b[?1049h";
-const restore_sequence = window.reset_state_sequence ++ "\x1b[?1049l";
+const restore_sequence = window.reset_state_sequence ++ window.program_status_clear ++ "\x1b[?1049l";
 
 pub const Outcome = enum {
     detached,
@@ -168,7 +170,7 @@ pub fn attach(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !Endi
         }
         if (background) |color| protocol.writeMsg(sock, .bg_color, &color.encode()) catch {};
 
-        switch (try relay(alloc, dir, sock, pipe_fds[0], previous, &eof_guard)) {
+        switch (try relay(alloc, dir, sock, pipe_fds[0], session, previous, &eof_guard)) {
             .end => |outcome| return .{ .outcome = outcome, .session = session },
             .move => |move| {
                 posix.close(sock);
@@ -196,7 +198,15 @@ fn connectMove(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !?Mo
     return .{ .sock = sock, .session = try alloc.dupe(u8, name) };
 }
 
-/// Relay between the terminal and one session's connection until the
+/// Draw the session menu over the canvas.
+fn drawMenu(alloc: std.mem.Allocator, menu: *Menu) !void {
+    const ws = ptypkg.getSize(0) catch ptypkg.makeWinsize(24, 80);
+    const bytes = try menu.frame(alloc, ws.row);
+    defer alloc.free(bytes);
+    try protocol.writeAll(1, bytes);
+}
+
+/// Relay between the terminal and the connection to `session` until the
 /// attachment ends or the client moves to another session. `previous`
 /// is the session `C-a L` returns to, if any.
 fn relay(
@@ -204,12 +214,17 @@ fn relay(
     dir: []const u8,
     sock: posix.fd_t,
     signal_fd: posix.fd_t,
+    session: []const u8,
     previous: ?[]const u8,
     eof_guard: *bool,
 ) !Step {
     const tty: posix.fd_t = 0;
     var decoder: protocol.Decoder = .init(alloc);
     defer decoder.deinit();
+    // The session menu, while it is open. It reads the terminal's keys,
+    // and the daemon sends no output.
+    var menu: ?Menu = null;
+    defer if (menu) |*m| m.deinit();
 
     var buf: [32 * 1024]u8 = undefined;
     var fds = [_]posix.pollfd{
@@ -238,6 +253,7 @@ fn relay(
                             .rows = new_ws.row,
                             .cols = new_ws.col,
                         }).encode()) catch {};
+                        if (menu) |*m| try drawMenu(alloc, m);
                     },
                     else => protocol.writeMsg(sock, .detach_req, "") catch {},
                 };
@@ -252,6 +268,21 @@ fn relay(
                 // TTY is gone; ask for an orderly detach.
                 stdin_open = false;
                 protocol.writeMsg(sock, .detach_req, "") catch {};
+            } else if (menu) |*m| {
+                const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
+                const choice = m.handleInput(buf[0..n], ws.row);
+                if (choice == .stay) {
+                    try drawMenu(alloc, m);
+                } else {
+                    if (choice == .pick and !std.mem.eql(u8, choice.pick, session)) {
+                        if (try connectMove(alloc, dir, choice.pick)) |move| return .{ .move = move };
+                    }
+                    // Cancelling closes the menu, and so does picking this
+                    // session or one that has gone.
+                    m.deinit();
+                    menu = null;
+                    protocol.writeMsg(sock, .close_menu, "") catch {};
+                }
             } else {
                 // The daemon may already have detached this client
                 // and closed the connection while these bytes were
@@ -297,6 +328,10 @@ fn relay(
                     },
                     .switch_back => if (previous) |p| if (try connectMove(alloc, dir, p)) |move| {
                         return .{ .move = move };
+                    },
+                    .menu => if (menu == null) {
+                        menu = try Menu.open(alloc, dir, session);
+                        try drawMenu(alloc, &menu.?);
                     },
                     else => {},
                 }

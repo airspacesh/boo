@@ -142,18 +142,26 @@ pub const commands = [_]Entry{
         \\usage: pane ls [--json]
         \\
         \\List sessions: name, attach state, idle time (time since the
-        \\last output or client input), and the session's title. A
-        \\session that does not answer within a second is listed as
-        \\busy. Stale sockets left by crashed daemons are cleaned up.
+        \\last output or client input), the status its program reports,
+        \\and the session's title. A session that does not answer within
+        \\a second is listed as busy. Stale sockets left by crashed
+        \\daemons are cleaned up.
+        \\
+        \\Programs such as coding agents report their status with OSC
+        \\7501, the Program Status Protocol: idle, working, done,
+        \\blocked, or error. pane keeps each session's latest report
+        \\and gives it to the terminal of the client attached to it.
         \\
         \\flags:
         \\  --json  emit a JSON array:
         \\          [{"name","responding","attached","idle_ms","unread",
-        \\            "bell_idle_ms","pid","title","client"}]
+        \\            "bell_idle_ms","pid","title","client","status"}]
         \\          ("unread" flags unseen output; "bell_idle_ms" is the
         \\           age of a bell rung while away, -1 if none; "pid" is
         \\           the session command's pid, -1 once it has exited;
-        \\           "client" is the attached client's terminal, or null)
+        \\           "client" is the attached client's terminal, or null;
+        \\           "status" is {"state","kind","progress","app","title",
+        \\           "msg"} with the keys the program sent, or null)
         \\          A busy session has only "name" and "responding".
         \\
         ,
@@ -290,6 +298,7 @@ pub const topics = [_]Entry{
         \\  C-a d   detach
         \\  C-a l   redraw
         \\  C-a [   scroll the session's history (copy mode), also C-a Esc
+        \\  C-a m   pick a session to switch to from a menu
         \\  C-a L   return to the session you switched from
         \\  C-a a   send a literal C-a
         \\
@@ -311,6 +320,10 @@ pub const topics = [_]Entry{
         \\The tag at the top right shows how many rows you have scrolled
         \\back, out of the rows of history. Output keeps reaching the
         \\session while you scroll.
+        \\
+        \\The menu lists the sessions as 'pane ls' does, with the cursor
+        \\on this one. It moves with the copy mode keys, Enter switches
+        \\to the session under the cursor, and q or Esc closes the menu.
         \\
         ,
     },
@@ -345,7 +358,8 @@ pub const topics = [_]Entry{
         \\
         \\machine-readable output:
         \\  pane ls --json    [{"name","responding","attached","idle_ms",
-        \\                    "unread","bell_idle_ms","pid","title","client"}]
+        \\                    "unread","bell_idle_ms","pid","title","client",
+        \\                    "status"}]
         \\  pane peek --json  {"session","title","rows","cols",
         \\                    "cursor":{"row","col"},"screen"}
         \\

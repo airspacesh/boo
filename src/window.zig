@@ -63,9 +63,15 @@ pub const Window = struct {
     /// session that queries the theme the instant it starts still gets
     /// an answer once the attaching client probes its terminal.
     bg_query_pending: bool = false,
-    /// Strips OSC 11 background queries from the child's output so the
-    /// daemon answers each exactly once (see oscquery.zig).
-    color_filter: oscquery.Filter = .{},
+    /// Strips the queries the daemon answers from the child's output so
+    /// each is answered exactly once (see oscquery.zig).
+    query_filter: oscquery.Filter = .{},
+
+    /// The body of the program's latest status report (OSC 7501) for
+    /// its root record, or empty when it has none. Reports with an id
+    /// are about parts of the program's work, which pane does not
+    /// track.
+    status: []u8 = &.{},
 
     /// Strips alternate-screen toggles from passthrough output; the
     /// daemon repaints from terminal state on screen switches instead.
@@ -127,6 +133,7 @@ pub const Window = struct {
             .size = effectSize,
             .title_changed = null,
             .pwd_changed = null,
+            .program_status = effectProgramStatus,
             .xtversion = effectXtversion,
         };
         self.stream = .initAlloc(alloc, handler);
@@ -138,6 +145,7 @@ pub const Window = struct {
         self.stream.deinit();
         self.term.deinit(self.alloc);
         self.alloc.free(self.command_title);
+        self.alloc.free(self.status);
         if (self.pty_fd >= 0) posix.close(self.pty_fd);
         self.alloc.destroy(self);
     }
@@ -170,6 +178,8 @@ pub const Window = struct {
     // the enum the same way as the device attributes type above.
     const ColorScheme = @typeInfo(EffectReturn("color_scheme")).optional.child;
 
+    const ProgramStatusReport = vt.osc.Command.ProgramStatus.Report;
+
     fn EffectReturn(comptime field_name: []const u8) type {
         const Effects = Stream.Handler.Effects;
         const field = std.meta.fieldInfo(
@@ -182,6 +192,20 @@ pub const Window = struct {
 
     fn effectBell(handler: *Stream.Handler) void {
         fromHandler(handler).bell = true;
+    }
+
+    /// Keep the program's root status record. A report replaces the
+    /// record whole, and `clear` removes it, as does a full reset.
+    fn effectProgramStatus(handler: *Stream.Handler, report: ProgramStatusReport) void {
+        if (report.readOption(.id) != null) return;
+        const self = fromHandler(handler);
+        const body = if (report.state == .clear) "" else report.data;
+        const kept = self.alloc.dupe(u8, body) catch {
+            log.warn("window: no memory to keep the program status", .{});
+            return;
+        };
+        self.alloc.free(self.status);
+        self.status = kept;
     }
 
     fn effectDeviceAttributes(handler: *Stream.Handler) DeviceAttributes {
@@ -242,19 +266,34 @@ pub const Window = struct {
         try protocol.writeAll(self.pty_fd, bytes);
     }
 
-    /// Copy `input` to `writer` with OSC 11 background queries removed,
-    /// answering each one. The query is answered with the background a
-    /// client reported; until one is known the query is recorded and
-    /// answered later by `setBackground`. Removing the query keeps it
-    /// from also reaching an attached client's real terminal, which
-    /// would answer it a second time.
-    pub fn filterColorQueries(
+    /// Copy `input` to `writer` with the queries the daemon answers
+    /// removed, answering each one. Removing a query keeps it from also
+    /// reaching an attached client's real terminal, which would answer it
+    /// a second time.
+    ///
+    /// A background query is answered with the background a client
+    /// reported. Until one is known, the query is recorded and answered
+    /// later by `setBackground`. A program status query is answered at
+    /// once, since the window keeps the status itself.
+    pub fn filterQueries(
         self: *Window,
         input: []const u8,
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
-        const result = try self.color_filter.feed(input, writer);
-        for (0..result.background_queries) |_| self.answerBackgroundQuery();
+        const result = try self.query_filter.feed(input, writer);
+        const background = result.get(.background_bel) + result.get(.background_st);
+        for (0..background) |_| self.answerBackgroundQuery();
+        for (0..result.get(.program_status_bel)) |_| self.writeReply(program_status_reply ++ "\x07");
+        for (0..result.get(.program_status_st)) |_| self.writeReply(program_status_reply ++ "\x1b\\");
+    }
+
+    const program_status_reply = "\x1b]7501;" ++ vt.osc.program_status.query_reply;
+
+    fn writeReply(self: *Window, reply: []const u8) void {
+        if (self.pty_fd < 0) return;
+        protocol.writeAll(self.pty_fd, reply) catch |err| {
+            log.warn("window: failed writing query reply: {}", .{err});
+        };
     }
 
     fn answerBackgroundQuery(self: *Window) void {
@@ -276,16 +315,13 @@ pub const Window = struct {
     }
 
     fn writeBackgroundReply(self: *Window, bg: protocol.RgbPayload) void {
-        if (self.pty_fd < 0) return;
         var buf: [40]u8 = undefined;
         const reply = std.fmt.bufPrint(
             &buf,
             "\x1b]11;rgb:{x:0>4}/{x:0>4}/{x:0>4}\x07",
             .{ bg.r, bg.g, bg.b },
         ) catch return;
-        protocol.writeAll(self.pty_fd, reply) catch |err| {
-            log.warn("window: failed writing OSC 11 reply: {}", .{err});
-        };
+        self.writeReply(reply);
     }
 
     pub fn resize(self: *Window, rows: u16, cols: u16) !void {
@@ -384,6 +420,7 @@ pub const Window = struct {
         // client terminal's title would go stale across reattach and
         // window switches.
         try writeTitle(self.title(), &out.writer);
+        try self.writeProgramStatus(&out.writer);
         var filter: altscreen.Filter = .{};
         var rest = raw.writer.buffered();
         while (rest.len > 0) rest = rest[(try filter.feed(rest, &out.writer)).consumed..];
@@ -489,6 +526,15 @@ pub const Window = struct {
         const steady = !self.term.modes.get(.cursor_blinking);
         try writer.print("\x1b[{d} q", .{shape + @intFromBool(steady)});
     }
+
+    /// Give the client terminal this window's program status (OSC 7501)
+    /// in place of whatever it held, which may be another session's. A
+    /// report replaces the root record whole, so the clear is needed only
+    /// when there is no status to send.
+    fn writeProgramStatus(self: *Window, writer: *std.Io.Writer) !void {
+        if (self.status.len == 0) return writer.writeAll(program_status_clear);
+        try writer.print("\x1b]7501;{s}\x1b\\", .{self.status});
+    }
 };
 
 /// Write the UTF-8 `text` without the control characters a terminal
@@ -519,6 +565,10 @@ fn writeTitle(title: []const u8, writer: *std.Io.Writer) !void {
     try writer.writeByte(0x07);
 }
 
+/// OSC 7501 with no id and the state `clear`, which removes every
+/// program status record the client terminal holds.
+pub const program_status_clear = "\x1b]7501;state=clear\x1b\\";
+
 /// Resets every piece of terminal state a window's repaint or
 /// passthrough may have changed, without touching the screen choice or
 /// the saved cursor. DECSTR is deliberately avoided: it clears the
@@ -546,8 +596,8 @@ pub const sanitize_sequence = reset_state_sequence ++ "\x1b[H\x1b[2J";
 /// Synchronized output (mode 2026) around a frame: the client terminal
 /// shows the frame only once it is complete, so the clear that starts
 /// it never flashes on screen.
-const begin_sync = "\x1b[?2026h";
-const end_sync = "\x1b[?2026l";
+pub const begin_sync = "\x1b[?2026h";
+pub const end_sync = "\x1b[?2026l";
 
 test "window state machine without a child" {
     // Exercise the terminal+stream wiring directly (no PTY): construct
@@ -751,7 +801,7 @@ test "OSC 11 background query is answered from the reported background" {
     // A query before any background is known is deferred, not dropped.
     var sink: [16]u8 = undefined;
     var w = std.Io.Writer.fixed(&sink);
-    try win.filterColorQueries("\x1b]11;?\x07", &w);
+    try win.filterQueries("\x1b]11;?\x07", &w);
     try std.testing.expectEqualStrings("", w.buffered()); // query stripped
     try std.testing.expect(win.bg_query_pending);
 
@@ -764,9 +814,60 @@ test "OSC 11 background query is answered from the reported background" {
 
     // A later query is answered immediately, now that the color is known.
     w = std.Io.Writer.fixed(&sink);
-    try win.filterColorQueries("\x1b]11;?\x07", &w);
+    try win.filterQueries("\x1b]11;?\x07", &w);
     const n2 = try posix.read(read_fd, &buf);
     try std.testing.expectEqualStrings("\x1b]11;rgb:ffff/ffff/ffff\x07", buf[0..n2]);
+}
+
+test "the program status query is answered at once with the query's terminator" {
+    const alloc = std.testing.allocator;
+    var read_fd: posix.fd_t = undefined;
+    var win = try testWindowWithPipe(alloc, &read_fd);
+    defer posix.close(read_fd);
+    defer posix.close(win.pty_fd);
+    defer win.term.deinit(alloc);
+
+    var sink: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    try win.filterQueries("\x1b]7501;?\x1b\\", &w);
+    try std.testing.expectEqualStrings("", w.buffered());
+    var buf: [128]u8 = undefined;
+    const n = try posix.read(read_fd, &buf);
+    try std.testing.expectEqualStrings(
+        "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\",
+        buf[0..n],
+    );
+}
+
+test "the window keeps the root program status and repaints it" {
+    const alloc = std.testing.allocator;
+    var read_fd: posix.fd_t = undefined;
+    var win = try testWindowWithPipe(alloc, &read_fd);
+    defer posix.close(read_fd);
+    defer posix.close(win.pty_fd);
+    defer win.term.deinit(alloc);
+    defer alloc.free(win.status);
+
+    var handler: Window.Stream.Handler = .init(&win.term);
+    handler.effects.program_status = Window.effectProgramStatus;
+    win.stream = .initAlloc(alloc, handler);
+    defer win.stream.deinit();
+
+    win.feed("\x1b]7501;state=working:app=make\x07");
+    try std.testing.expectEqualStrings("state=working:app=make", win.status);
+    win.feed("\x1b]7501;state=done:id=test\x07\x1b]7501;state=clear:id=test\x07");
+    try std.testing.expectEqualStrings("state=working:app=make", win.status);
+
+    var frame: std.Io.Writer.Allocating = .init(alloc);
+    defer frame.deinit();
+    try win.writeProgramStatus(&frame.writer);
+    try std.testing.expectEqualStrings("\x1b]7501;state=working:app=make\x1b\\", frame.written());
+
+    win.feed("\x1bc");
+    try std.testing.expectEqualStrings("", win.status);
+    frame.clearRetainingCapacity();
+    try win.writeProgramStatus(&frame.writer);
+    try std.testing.expectEqualStrings(program_status_clear, frame.written());
 }
 
 test "color-scheme DSR answered from background luminance" {
@@ -788,6 +889,7 @@ test "color-scheme DSR answered from background luminance" {
         .size = null,
         .title_changed = null,
         .pwd_changed = null,
+        .program_status = null,
         .xtversion = null,
     };
     win.stream = .initAlloc(alloc, handler);

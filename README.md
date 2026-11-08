@@ -38,8 +38,9 @@ pane kill work              # end a session
 pane switch work build      # show build where work is shown
 ```
 
-Inside a session, `C-a d` detaches, `C-a Esc` scrolls the history, and
-`C-a L` returns to the session you switched from.
+Inside a session, `C-a d` detaches, `C-a Esc` scrolls the history,
+`C-a m` opens a menu of sessions to switch to, and `C-a L` returns to
+the session you switched from.
 Run `pane help` for every command and key.
 
 ## License

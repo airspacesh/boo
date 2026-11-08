@@ -1,4 +1,4 @@
-//! Filtering of OSC 11 background-color *queries* out of a window's
+//! Filtering of the queries the daemon answers itself out of a window's
 //! output stream.
 //!
 //! Applications detect the terminal's light/dark theme by querying the
@@ -8,64 +8,78 @@
 //! daemon therefore answers these queries itself from the background a
 //! client reported (see `window.zig`).
 //!
-//! For that answer to be the only one, the query must not also reach the
+//! Programs ask whether the terminal keeps their status with the OSC
+//! 7501 support query (`ESC ] 7501 ; ? ESC \`). The daemon keeps it,
+//! whatever terminal a client attaches from, so it answers that query
+//! too.
+//!
+//! For each answer to be the only one, the query must not also reach the
 //! real terminal, or an attached client would see a duplicate reply land
-//! in its input. This filter removes the query from the passthrough
+//! in its input. This filter removes the queries from the passthrough
 //! stream and reports each removal so the caller can produce exactly one
-//! reply. Only the background query (OSC 11) is stripped; OSC 10/12 and
-//! every other sequence pass through unchanged. Candidate sequences split
-//! across feeds are carried over to the next call.
+//! reply. OSC 10/12 queries and every other sequence pass through
+//! unchanged. Candidate sequences split across feeds are carried over to
+//! the next call.
 
 const std = @import("std");
 
-/// The two encodings of an OSC 11 background query: BEL-terminated (what
-/// nvim and most apps send) and ST-terminated (`ESC \`).
-const query_bel = "\x1b]11;?\x07";
-const query_st = "\x1b]11;?\x1b\\";
+/// A query the daemon answers, in each encoding it may arrive in:
+/// BEL-terminated (what nvim and most apps send) and ST-terminated
+/// (`ESC \`). The reply ends with the query's own terminator.
+pub const Query = enum {
+    background_bel,
+    background_st,
+    program_status_bel,
+    program_status_st,
 
-const Match = enum { no, partial, complete };
+    fn bytes(self: Query) []const u8 {
+        return switch (self) {
+            .background_bel => "\x1b]11;?\x07",
+            .background_st => "\x1b]11;?\x1b\\",
+            .program_status_bel => "\x1b]7501;?\x07",
+            .program_status_st => "\x1b]7501;?\x1b\\",
+        };
+    }
+};
 
-/// Classify `bytes` against a single target: a strict prefix is
-/// `partial`, an exact match is `complete`, anything else is `no`.
-fn matchTarget(target: []const u8, bytes: []const u8) Match {
-    if (bytes.len > target.len) return .no;
-    if (!std.mem.eql(u8, target[0..bytes.len], bytes)) return .no;
-    return if (bytes.len == target.len) .complete else .partial;
-}
+/// How many of each query a feed removed.
+pub const Result = std.EnumArray(Query, usize);
 
-/// Classify `bytes` against both query encodings, taking the strongest
-/// result (a complete match of either, else a partial of either).
+const Match = union(enum) { no, partial, complete: Query };
+
+/// Classify `bytes` against every query. An exact match is `complete`,
+/// a strict prefix of any is `partial`, and anything else is `no`. No
+/// query is a prefix of another.
 fn classify(bytes: []const u8) Match {
-    const bel = matchTarget(query_bel, bytes);
-    const st = matchTarget(query_st, bytes);
-    if (bel == .complete or st == .complete) return .complete;
-    if (bel == .partial or st == .partial) return .partial;
-    return .no;
+    var partial = false;
+    for (std.enums.values(Query)) |query| {
+        const target = query.bytes();
+        if (bytes.len > target.len) continue;
+        if (!std.mem.eql(u8, target[0..bytes.len], bytes)) continue;
+        if (bytes.len == target.len) return .{ .complete = query };
+        partial = true;
+    }
+    return if (partial) .partial else .no;
 }
 
-/// Incremental scanner that copies input to a writer, removing any OSC 11
-/// background query. Held candidate bytes persist across feeds so a query
-/// split over reads is still recognized.
+/// Incremental scanner that copies input to a writer, removing every
+/// query. Held candidate bytes persist across feeds so a query split over
+/// reads is still recognized.
 pub const Filter = struct {
-    /// Held candidate bytes: always a strict prefix of an OSC 11 query.
-    /// Empty when not mid-candidate. The longest prefix is
-    /// `ESC ] 1 1 ; ? ESC` (8 bytes, awaiting the ST `\`).
+    /// Held candidate bytes, always a strict prefix of a query. Empty
+    /// when not mid-candidate. The longest prefix is
+    /// `ESC ] 7 5 0 1 ; ? ESC` (9 bytes, awaiting the ST `\`).
     buf: [16]u8 = undefined,
     len: usize = 0,
 
-    pub const Result = struct {
-        /// Number of OSC 11 background queries removed from the stream.
-        background_queries: usize = 0,
-    };
-
     /// Scan `input`, writing passthrough bytes to `writer` and removing
-    /// OSC 11 background queries. Reports how many were removed.
+    /// queries. Reports how many of each were removed.
     pub fn feed(
         self: *Filter,
         input: []const u8,
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!Result {
-        var result: Result = .{};
+        var result: Result = .initFill(0);
         var run_start: usize = 0;
         var i: usize = 0;
         while (i < input.len) {
@@ -87,18 +101,18 @@ pub const Filter = struct {
                     self.len += 1;
                     i += 1;
                 },
-                .complete => {
+                .complete => |query| {
                     // A full query: drop it. The daemon answers it.
                     self.len = 0;
-                    result.background_queries += 1;
+                    result.getPtr(query).* += 1;
                     i += 1;
                     run_start = i;
                 },
                 .no => {
                     // The held prefix was ordinary output after all, so
                     // emit it verbatim and reconsider the current byte.
-                    // The ESC that ends `ESC ] 1 1 ; ? ESC` may begin
-                    // the next query instead, so it stays held.
+                    // The ESC that ends a prefix like `ESC ] 1 1 ; ? ESC`
+                    // may begin the next query instead, so it stays held.
                     const ends_in_esc = self.len > 1 and self.buf[self.len - 1] == 0x1b;
                     const emit_len = if (ends_in_esc) self.len - 1 else self.len;
                     try writer.writeAll(self.buf[0..emit_len]);
@@ -125,7 +139,9 @@ fn testFeed(filter: *Filter, input: []const u8, expected: []const u8, queries: u
     var writer = std.Io.Writer.fixed(&buf);
     const got = try filter.feed(input, &writer);
     try std.testing.expectEqualStrings(expected, writer.buffered());
-    try std.testing.expectEqual(queries, got.background_queries);
+    var removed: usize = 0;
+    for (got.values) |count| removed += count;
+    try std.testing.expectEqual(queries, removed);
 }
 
 test "plain text and ordinary sequences pass through" {
@@ -206,4 +222,26 @@ test "query right after an unterminated query is removed" {
 test "lone ESC then ordinary bytes pass through" {
     var f: Filter = .{};
     try testFeed(&f, "\x1bMtext", "\x1bMtext", 0);
+}
+
+test "OSC 7501 support queries are removed and counted by terminator" {
+    var f: Filter = .{};
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const got = try f.feed("a\x1b]7501;?\x1b\\b\x1b]7501;?\x07c\x1b]11;?\x07", &writer);
+    try std.testing.expectEqualStrings("abc", writer.buffered());
+    try std.testing.expectEqual(1, got.get(.program_status_st));
+    try std.testing.expectEqual(1, got.get(.program_status_bel));
+    try std.testing.expectEqual(1, got.get(.background_bel));
+}
+
+test "OSC 7501 reports pass through" {
+    var f: Filter = .{};
+    try testFeed(&f, "\x1b]7501;state=working\x1b\\", "\x1b]7501;state=working\x1b\\", 0);
+}
+
+test "OSC 7501 query split before the backslash is still removed" {
+    var f: Filter = .{};
+    try testFeed(&f, "x\x1b]7501;?\x1b", "x", 0);
+    try testFeed(&f, "\\y", "y", 1);
 }
