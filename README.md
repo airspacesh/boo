@@ -11,13 +11,12 @@ Terminal sessions that keep running when you leave.
 
 </div>
 
-pane is a GNU `screen` style terminal multiplexer built on
-[libghostty](https://github.com/ghostty-org/ghostty). Every session's
-output runs through Ghostty's terminal core, so reattaching restores the
-exact screen, and scripts and agents read the same screen you would see.
+Pane is a simple GNU screen style terminal multiplexer built on
+[libghostty](https://github.com/ghostty-org/ghostty). It is designed to be used by
+agents to start work in panes you can then attach and interact with. The goal is
+to give agents the freedom to manage your terminal for you.
 
-pane is a fork of [coder/boo](https://github.com/coder/boo), from its
-v0.6.4 release.
+Originally forked from [coder/boo](https://github.com/coder/boo).
 
 ## Install
 
