@@ -796,7 +796,9 @@ test "new --cwd rejects a missing directory" {
     const ls = try h.run(&.{"ls"});
     defer alloc.free(ls.stdout);
     defer alloc.free(ls.stderr);
-    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "bad") == null);
+    // The listing names the socket directory, whose random name may
+    // contain "bad", so check for an empty listing instead.
+    try std.testing.expect(std.mem.startsWith(u8, ls.stdout, "No sessions"));
 }
 
 test "session listing shows attach state" {
