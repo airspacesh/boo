@@ -1,10 +1,10 @@
 <div align="center">
 <pre>
- _ __   __ _ _ __   ___
+ _ __   __ _ _ __   ___ 
 | '_ \ / _` | '_ \ / _ \
 | |_) | (_| | | | |  __/
 | .__/ \__,_|_| |_|\___|
-|_|
+|_|                     
 </pre>
 
 Terminal sessions that keep running when you leave.
