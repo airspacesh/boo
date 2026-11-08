@@ -89,6 +89,8 @@ const Harness = struct {
             .argv = full_argv.items,
             .cwd = cwd,
             .env_map = &env,
+            // Room for a full peek of a big session's history.
+            .max_output_bytes = 4 << 20,
         });
     }
 
@@ -275,11 +277,15 @@ const Deadline = struct {
         return .{ .end = std.time.milliTimestamp() + @as(i64, @intCast(ms)) };
     }
 
-    fn tick(self: *Deadline, comptime what: []const u8) !void {
+    fn check(self: *Deadline, comptime what: []const u8) !void {
         if (std.time.milliTimestamp() > self.end) {
             std.debug.print("timeout: " ++ what ++ "\n", .{});
             return error.Timeout;
         }
+    }
+
+    fn tick(self: *Deadline, comptime what: []const u8) !void {
+        try self.check(what);
         std.Thread.sleep(25 * std.time.ns_per_ms);
     }
 };
@@ -422,7 +428,7 @@ const PtyClient = struct {
     fn waitFor(self: *PtyClient, needle: []const u8) !void {
         var deadline = Deadline.init(default_timeout_ms);
         while (std.mem.indexOf(u8, self.output.items, needle) == null) {
-            _ = self.pump(100) catch |err| switch (err) {
+            const got = self.pump(100) catch |err| switch (err) {
                 error.ClientGone => {
                     if (std.mem.indexOf(u8, self.output.items, needle) != null) return;
                     std.debug.print(
@@ -433,7 +439,10 @@ const PtyClient = struct {
                 },
                 else => return err,
             };
-            deadline.tick("waiting for output") catch |err| {
+            // Read on without a pause while output flows, so a large
+            // frame arrives as fast as the client writes it.
+            const waited = if (got) deadline.check("waiting for output") else deadline.tick("waiting for output");
+            waited catch |err| {
                 std.debug.print(
                     "--- waiting for {s} --- captured:\n{s}\n---\n",
                     .{ needle, self.output.items },
@@ -1713,6 +1722,107 @@ test "plain attach replays the visible screen only, never scrollback history" {
     try client.send("\x01d");
     try client.waitFor("detached from plain");
     _ = try client.waitExit();
+}
+
+/// Start a detached session of the given size whose command writes
+/// `bytes` to its terminal and then idles.
+fn startDetachedWriting(
+    h: *Harness,
+    session: []const u8,
+    rows: u16,
+    cols: u16,
+    bytes: []const u8,
+) !void {
+    const path = try std.fmt.allocPrint(h.alloc, "{s}/{s}.bin", .{ h.dir, session });
+    defer h.alloc.free(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = bytes });
+    const script = try std.fmt.allocPrint(h.alloc, "cat {s}; exec sleep 600", .{path});
+    defer h.alloc.free(script);
+    var rows_buf: [8]u8 = undefined;
+    var cols_buf: [8]u8 = undefined;
+    const rows_arg = try std.fmt.bufPrint(&rows_buf, "{d}", .{rows});
+    const cols_arg = try std.fmt.bufPrint(&cols_buf, "{d}", .{cols});
+    try h.runOk(&.{ "new", session, "-d", "--rows", rows_arg, "--cols", cols_arg, "--", "sh", "-c", script });
+    try h.waitSessionUp(session);
+}
+
+test "a repaint larger than one protocol message reaches the client whole" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Per-cell truecolor, as image viewers draw it, makes the repaint of
+    // a big screen larger than protocol.max_payload.
+    const rows = 110;
+    const cols = 250;
+    var image: std.ArrayList(u8) = .empty;
+    defer image.deinit(alloc);
+    var prng: std.Random.DefaultPrng = .init(1);
+    const random = prng.random();
+    for (0..rows - 1) |_| {
+        for (0..cols) |_| {
+            try image.print(alloc, "\x1b[38;2;{d};{d};{d}m\x1b[48;2;{d};{d};{d}m\u{2580}", .{
+                random.int(u8), random.int(u8), random.int(u8),
+                random.int(u8), random.int(u8), random.int(u8),
+            });
+        }
+        try image.appendSlice(alloc, "\x1b[0m\r\n");
+    }
+    try image.appendSlice(alloc, "END-MARK");
+    try startDetachedWriting(&h, "big", rows, cols, image.items);
+    const peeked = try h.waitPeekContains("big", "END-MARK");
+    defer alloc.free(peeked);
+
+    var client = try PtyClient.spawn(&h, &.{ "attach", "big" }, rows, cols);
+    defer client.deinit();
+    try client.waitFor("END-MARK");
+
+    // The client shows exactly the screen the session holds.
+    const screen = try renderScreen(alloc, client.output.items, rows, cols);
+    defer alloc.free(screen);
+    try std.testing.expectEqualStrings(
+        std.mem.trimRight(u8, peeked, "\n"),
+        std.mem.trimRight(u8, screen, "\n"),
+    );
+
+    try client.send("\x01d");
+    try client.waitFor("detached from big");
+    _ = try client.waitExit();
+}
+
+test "peek --scrollback returns the whole history when it outgrows one message" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // 1600 rows of 3-byte characters keep over protocol.max_payload of
+    // history.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (0..1600) |i| try text.print(alloc, "L{d:0>5} {s}\r\n", .{ i, "\u{2500}" ** 240 });
+    try text.appendSlice(alloc, "LIVE-PROMPT$ ");
+    try startDetachedWriting(&h, "hist", 10, 250, text.items);
+    const peeked = try h.waitPeekContains("hist", "LIVE-PROMPT$");
+    alloc.free(peeked);
+
+    const plain = try h.run(&.{ "peek", "hist", "--scrollback" });
+    defer alloc.free(plain.stdout);
+    defer alloc.free(plain.stderr);
+    try std.testing.expect(plain.term.Exited == 0);
+    try std.testing.expect(plain.stdout.len > 1 << 20);
+    // Both ends survive: the first line, and the live screen at the
+    // bottom.
+    try std.testing.expect(std.mem.startsWith(u8, plain.stdout, "L00000 "));
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimRight(u8, plain.stdout, " \n"), "LIVE-PROMPT$"));
+
+    const json = try h.run(&.{ "peek", "hist", "--scrollback", "--json" });
+    defer alloc.free(json.stdout);
+    defer alloc.free(json.stderr);
+    try std.testing.expect(json.term.Exited == 0);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json.stdout, .{});
+    defer parsed.deinit();
+    const screen = parsed.value.object.get("screen").?.string;
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimRight(u8, screen, " \n"), "LIVE-PROMPT$"));
 }
 
 /// Render a copy mode frame and return its first row, which ends in the

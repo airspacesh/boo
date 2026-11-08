@@ -174,7 +174,9 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
             try decoder.feed(buf[0..n]);
             while (try decoder.next()) |msg| {
                 switch (msg.type) {
-                    .output => try protocol.writeAll(1, msg.payload),
+                    // Output is a byte stream, so the leading pieces
+                    // of a large output can be written as they arrive.
+                    .part, .output => try protocol.writeAll(1, msg.payload),
                     .detached => {
                         if (std.mem.eql(u8, msg.payload, "stolen")) return .stolen;
                         if (std.mem.eql(u8, msg.payload, "detached-eof")) {
@@ -504,6 +506,8 @@ pub fn control(
 
     var decoder: protocol.Decoder = .init(alloc);
     defer decoder.deinit();
+    var reply: std.ArrayList(u8) = .empty;
+    defer reply.deinit(alloc);
     var buf: [4096]u8 = undefined;
     const deadline: ?i64 = if (timeout_ms) |ms|
         std.time.milliTimestamp() + ms
@@ -524,8 +528,11 @@ pub fn control(
         try decoder.feed(buf[0..n]);
         while (try decoder.next()) |msg| {
             switch (msg.type) {
-                .ok => return .{ .ok = true, .text = try alloc.dupe(u8, msg.payload) },
-                .err => return .{ .ok = false, .text = try alloc.dupe(u8, msg.payload) },
+                .part => try reply.appendSlice(alloc, msg.payload),
+                .ok, .err => {
+                    try reply.appendSlice(alloc, msg.payload);
+                    return .{ .ok = msg.type == .ok, .text = try reply.toOwnedSlice(alloc) };
+                },
                 // Skip async frames (e.g. exit broadcast racing a quit).
                 else => {},
             }

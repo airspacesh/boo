@@ -37,6 +37,10 @@ pub const MsgType = enum(u8) {
     exit = 66,
     ok = 67,
     err = 68,
+    /// A leading piece of a payload larger than `max_payload`. The
+    /// pieces arrive in order, and a message of the payload's own type
+    /// carries the last piece (see `appendMsg`).
+    part = 69,
     _,
 };
 
@@ -115,16 +119,31 @@ pub fn writeMsg(fd: std.posix.fd_t, msg_type: MsgType, payload: []const u8) !voi
     try writeAll(fd, payload);
 }
 
-/// Append a full frame (header + payload) to a growable buffer, for
-/// callers that queue output to flush later instead of writing it to a
-/// fd right away (e.g. a non-blocking socket with backpressure).
+/// Append a message to a growable buffer, for callers that queue output
+/// to flush later instead of writing it to a fd right away (e.g. a
+/// non-blocking socket with backpressure). A payload larger than
+/// `max_payload` goes as `.part` frames carrying its leading pieces,
+/// then a `msg_type` frame carrying the rest.
 pub fn appendMsg(
     alloc: std.mem.Allocator,
     list: *std.ArrayList(u8),
     msg_type: MsgType,
     payload: []const u8,
 ) !void {
-    std.debug.assert(payload.len <= max_payload);
+    var rest = payload;
+    while (rest.len > max_payload) {
+        try appendFrame(alloc, list, .part, rest[0..max_payload]);
+        rest = rest[max_payload..];
+    }
+    try appendFrame(alloc, list, msg_type, rest);
+}
+
+fn appendFrame(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    msg_type: MsgType,
+    payload: []const u8,
+) !void {
     var header: [header_len]u8 = undefined;
     header[0] = @intFromEnum(msg_type);
     std.mem.writeInt(u32, header[1..5], @intCast(payload.len), .little);
@@ -139,7 +158,7 @@ pub fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
 
 /// Incremental frame decoder. Feed bytes as they arrive from the socket,
 /// pop complete messages out with next(). Payloads returned by next() are
-/// valid until the following call to feed() or next().
+/// valid until the following call to feed().
 pub const Decoder = struct {
     alloc: std.mem.Allocator,
     buf: std.ArrayList(u8) = .empty,
@@ -153,15 +172,17 @@ pub const Decoder = struct {
         self.buf.deinit(self.alloc);
     }
 
+    /// Drops the messages next() has returned before appending, so
+    /// popping many messages from one feed takes time linear in its size.
     pub fn feed(self: *Decoder, bytes: []const u8) !void {
-        self.compact();
+        self.buf.replaceRangeAssumeCapacity(0, self.consumed, &.{});
+        self.consumed = 0;
         try self.buf.appendSlice(self.alloc, bytes);
     }
 
     /// Returns the next complete message, or null if more bytes are needed.
     pub fn next(self: *Decoder) error{PayloadTooLarge}!?Msg {
-        self.compact();
-        const items = self.buf.items;
+        const items = self.buf.items[self.consumed..];
         if (items.len < header_len) return null;
 
         const len = std.mem.readInt(u32, items[1..5], .little);
@@ -169,17 +190,11 @@ pub const Decoder = struct {
         const total = header_len + @as(usize, len);
         if (items.len < total) return null;
 
-        self.consumed = total;
+        self.consumed += total;
         return .{
             .type = @enumFromInt(items[0]),
             .payload = items[header_len..total],
         };
-    }
-
-    fn compact(self: *Decoder) void {
-        if (self.consumed == 0) return;
-        self.buf.replaceRangeAssumeCapacity(0, self.consumed, &.{});
-        self.consumed = 0;
     }
 };
 

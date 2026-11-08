@@ -550,9 +550,6 @@ pub const Daemon = struct {
                 }
                 try out.append(self.alloc, '\n');
                 try out.appendSlice(self.alloc, text);
-                if (out.items.len > protocol.max_payload) {
-                    out.shrinkRetainingCapacity(protocol.max_payload);
-                }
                 conn.send(.ok, out.items);
             } else conn.send(.err, "no window");
         } else if (std.mem.eql(u8, cmd, "info")) {
