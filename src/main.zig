@@ -103,9 +103,9 @@ fn flagValue(
 
 /// Parse a positive terminal dimension (rows or cols) for `boo new`.
 fn parseDimension(comptime flag: []const u8, value: []const u8) u16 {
-    const n = std.fmt.parseInt(u16, value, 10) catch
-        usageFail("new", flag ++ " expects a number from 1 to 65535", .{});
-    if (n == 0) usageFail("new", flag ++ " must be at least 1", .{});
+    const max = daemonpkg.max_dimension;
+    const n = std.fmt.parseInt(u16, value, 10) catch 0;
+    if (n == 0 or n > max) usageFail("new", flag ++ " expects a number from 1 to {d}", .{max});
     return n;
 }
 

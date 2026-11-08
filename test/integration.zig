@@ -1920,6 +1920,36 @@ test "session commands start with default SIGHUP and SIGPIPE handling" {
     try std.testing.expect(std.mem.indexOf(u8, screen, "42-") == null);
 }
 
+test "an attach size past the limit is capped, not applied" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("huge", &.{"cat"});
+
+    // A client claiming a 65535 by 65535 terminal. Applied as given, the
+    // resize would wedge the daemon for minutes.
+    const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(sock);
+    var addr: posix.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
+    @memset(&addr.path, 0);
+    _ = try std.fmt.bufPrint(&addr.path, "{s}/huge.sock", .{h.dir});
+    try posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+    // An attach frame (type 1) with a rows, cols size payload, as
+    // src/protocol.zig defines it.
+    const frame = [_]u8{ 1, 4, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
+    _ = try posix.write(sock, &frame);
+
+    const peek = try h.run(&.{ "peek", "huge", "--json" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term == .Exited and peek.term.Exited == 0);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, peek.stdout, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("rows").?.integer < 0xffff);
+    try std.testing.expect(parsed.value.object.get("cols").?.integer < 0xffff);
+}
+
 /// Stand in for a live daemon that refuses connections, as one does
 /// between bind and listen or with a full backlog. Holds the session's
 /// lock (see src/claim.zig) and binds its socket without listening.

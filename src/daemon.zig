@@ -44,6 +44,12 @@ pub const Options = struct {
 /// connection is dropped. Generous, so an ordinary burst never trips it.
 const max_conn_out: usize = 8 * 1024 * 1024;
 
+/// The largest number of rows or columns a session takes, beyond any
+/// real terminal (4096 columns of 4-pixel cells overflow a 16K display).
+/// The terminal's memory and the time to resize it grow with rows times
+/// columns, and 65535 by 65535 wedges the daemon for minutes.
+pub const max_dimension: u16 = 4096;
+
 /// Upper bound on how long teardown waits for queued finals to drain.
 const shutdown_drain_ms: i64 = 250;
 
@@ -857,10 +863,12 @@ pub const Daemon = struct {
 
     fn resizeWindow(self: *Daemon, rows: u16, cols: u16) void {
         if (rows == 0 or cols == 0) return;
-        self.rows = rows;
-        self.cols = cols;
+        // A client reports its terminal's real size, so a size past the
+        // limit is capped rather than refused.
+        self.rows = @min(rows, max_dimension);
+        self.cols = @min(cols, max_dimension);
         if (self.liveWindow()) |w| {
-            w.resize(rows, cols) catch |err| {
+            w.resize(self.rows, self.cols) catch |err| {
                 log.warn("resize window failed: {}", .{err});
             };
         }

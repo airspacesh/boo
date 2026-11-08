@@ -79,6 +79,8 @@ pub const commands = [_]Entry{
         \\  --rows N        initial terminal height (default 24); the
         \\                  next attach resizes to the real terminal
         \\  --cols N        initial terminal width (default 80)
+        \\                  Sessions are at most 4096 rows by 4096
+        \\                  columns.
         \\  --cwd DIR       run the command in DIR instead of the
         \\                  current directory (must already exist)
         \\
