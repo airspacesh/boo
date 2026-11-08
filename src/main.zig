@@ -4,6 +4,7 @@
 const std = @import("std");
 const posix = std.posix;
 
+const claimpkg = @import("claim.zig");
 const client = @import("client.zig");
 const daemonpkg = @import("daemon.zig");
 const help = @import("help.zig");
@@ -176,16 +177,15 @@ pub const SessionInfo = struct {
 
 /// Query a session daemon, deleting the socket when the daemon is gone.
 /// A non-null `timeout_ms` bounds the control round-trip so a slow daemon
-/// cannot hang the caller; a timeout reports no info but leaves the socket
-/// in place, because a slow daemon is not a dead one.
+/// cannot hang the caller. A daemon that does not answer reports no info,
+/// and its socket stays unless no daemon holds the session's name.
 pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, timeout_ms: ?u32) !?SessionInfo {
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
     const result = client.control(alloc, sock, &.{"info"}, timeout_ms) catch |err| {
         // A timeout means the daemon is busy, not gone; keep the socket.
         if (err == error.Timeout) return null;
-        // Stale socket: the daemon is gone.
-        std.fs.cwd().deleteFile(sock) catch {};
+        _ = claimpkg.removeStale(alloc, dir, name) catch {};
         return null;
     };
     errdefer alloc.free(result.text);
@@ -306,17 +306,11 @@ fn createSession(
             fail(exit_runtime, "--cwd {s}: cannot resolve directory", .{d});
     } else null;
 
-    const sock = try paths.socketPath(alloc, dir, name);
-    defer alloc.free(sock);
-
-    const listen_fd = bindListen(alloc, sock) catch |err| switch (err) {
-        error.SessionExists => fail(
-            exit_runtime,
-            "session {s} already exists (run 'boo attach {s}')",
-            .{ name, name },
-        ),
-        else => return err,
-    };
+    const session = try claimpkg.claim(alloc, dir, name) orelse fail(
+        exit_runtime,
+        "session {s} already exists (run 'boo attach {s}')",
+        .{ name, name },
+    );
 
     // Fork the session daemon. The listening socket already exists, so
     // there is no race between daemon startup and the first attach.
@@ -325,21 +319,19 @@ fn createSession(
     if (posix.getenv("BOO_FOREGROUND") != null) {
         var opts: daemonpkg.Options = .{
             .name = name,
-            .socket_path = sock,
-            .listen_fd = listen_fd,
             .argv = cmd_argv,
         };
         if (rows) |r| opts.rows = r;
         if (cols) |c| opts.cols = c;
         opts.cwd = cwd;
-        try daemonpkg.Daemon.run(alloc, opts);
+        try daemonpkg.Daemon.run(alloc, session, opts);
         return;
     }
     const pid = try posix.fork();
     if (pid == 0) {
-        runDaemon(alloc, name, sock, listen_fd, cmd_argv, rows, cols, cwd);
+        runDaemon(alloc, name, session, cmd_argv, rows, cols, cwd);
     }
-    posix.close(listen_fd);
+    session.closeInherited(alloc);
 
     if (detached) {
         // The name on stdout so scripts can capture it.
@@ -779,7 +771,7 @@ fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             const sock = try paths.socketPath(alloc, dir, name);
             defer alloc.free(sock);
             const result = client.control(alloc, sock, &.{"quit"}, null) catch {
-                std.fs.cwd().deleteFile(sock) catch {};
+                _ = claimpkg.removeStale(alloc, dir, name) catch {};
                 continue;
             };
             alloc.free(result.text);
@@ -940,8 +932,7 @@ fn openLogSink() ?posix.fd_t {
 fn runDaemon(
     alloc: std.mem.Allocator,
     name: []const u8,
-    sock: []const u8,
-    listen_fd: posix.fd_t,
+    session: claimpkg.Claim,
     argv: []const []const u8,
     rows: ?u16,
     cols: ?u16,
@@ -965,45 +956,16 @@ fn runDaemon(
 
     var opts: daemonpkg.Options = .{
         .name = name,
-        .socket_path = sock,
-        .listen_fd = listen_fd,
         .argv = argv,
     };
     if (rows) |r| opts.rows = r;
     if (cols) |c| opts.cols = c;
     opts.cwd = cwd;
-    daemonpkg.Daemon.run(alloc, opts) catch |err| {
+    daemonpkg.Daemon.run(alloc, session, opts) catch |err| {
         std.log.err("daemon failed: {}", .{err});
         posix.exit(1);
     };
     posix.exit(0);
-}
-
-pub fn bindListen(alloc: std.mem.Allocator, sock_path: []const u8) !posix.fd_t {
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(fd);
-
-    var addr: posix.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
-    if (sock_path.len >= addr.path.len) return error.NameTooLong;
-    @memset(&addr.path, 0);
-    @memcpy(addr.path[0..sock_path.len], sock_path);
-
-    posix.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| switch (err) {
-        error.AddressInUse => {
-            // Either a live session or a stale socket file.
-            if (client.connect(alloc, sock_path)) |probe| {
-                posix.close(probe);
-                return error.SessionExists;
-            } else |_| {
-                try std.fs.cwd().deleteFile(sock_path);
-                try posix.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
-            }
-        },
-        else => return err,
-    };
-
-    try posix.listen(fd, 8);
-    return fd;
 }
 
 // -- Tests ----------------------------------------------------------------
@@ -1071,5 +1033,6 @@ test {
     _ = @import("window.zig");
     _ = @import("daemon.zig");
     _ = @import("client.zig");
+    _ = @import("claim.zig");
     _ = @import("help.zig");
 }

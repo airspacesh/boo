@@ -1848,6 +1848,49 @@ test "rename: moves a session to a new name" {
     try h.runExit(&.{ "rename", "after" }, 2);
 }
 
+/// Stand in for a live daemon that refuses connections, as one does
+/// between bind and listen or with a full backlog. Holds the session's
+/// lock (see src/claim.zig) and binds its socket without listening.
+/// Returns the lock fd and the socket fd.
+fn holdUnresponsiveSession(h: *Harness, name: []const u8) ![2]posix.fd_t {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.lock", .{ h.dir, name });
+    const lock_fd = try posix.open(lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+    errdefer posix.close(lock_fd);
+    try posix.flock(lock_fd, posix.LOCK.EX | posix.LOCK.NB);
+
+    const sock_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    errdefer posix.close(sock_fd);
+    var addr: posix.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
+    @memset(&addr.path, 0);
+    _ = try std.fmt.bufPrint(&addr.path, "{s}/{s}.sock", .{ h.dir, name });
+    try posix.bind(sock_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+    return .{ lock_fd, sock_fd };
+}
+
+test "a live session that refuses connections keeps its socket and name" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    const held = try holdUnresponsiveSession(&h, "held");
+    defer for (held) |fd| posix.close(fd);
+    const sock = try std.fmt.allocPrint(alloc, "{s}/held.sock", .{h.dir});
+    defer alloc.free(sock);
+
+    // Listing and sweeping must not take a refused connection for a
+    // dead daemon and delete its socket.
+    try h.runOk(&.{"ls"});
+    try h.runOk(&.{ "kill", "--all" });
+    try std.fs.cwd().access(sock, .{});
+
+    // Nor may a new session take the name.
+    try h.runExit(&.{ "new", "held", "-d", "--", "cat" }, 1);
+    try h.startDetached("other", &.{"cat"});
+    try h.runExit(&.{ "rename", "other", "held" }, 1);
+    try std.fs.cwd().access(sock, .{});
+}
+
 /// Render raw client output through a terminal emulator and return
 /// the resulting screen text, one line per row. Raw byte matching
 /// cannot tell whether content survives on screen (a later erase can

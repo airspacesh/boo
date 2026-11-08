@@ -14,6 +14,7 @@
 const std = @import("std");
 const posix = std.posix;
 
+const claimpkg = @import("claim.zig");
 const protocol = @import("protocol.zig");
 const keys = @import("keys.zig");
 const copymode = @import("copymode.zig");
@@ -22,14 +23,11 @@ const paths = @import("paths.zig");
 const reap = @import("reap.zig");
 const windowpkg = @import("window.zig");
 const Window = windowpkg.Window;
-const main = @import("main.zig");
 
 const log = std.log.scoped(.daemon);
 
 pub const Options = struct {
     name: []const u8,
-    socket_path: []const u8,
-    listen_fd: posix.fd_t,
     argv: []const []const u8,
     rows: u16 = 24,
     cols: u16 = 80,
@@ -169,10 +167,12 @@ pub const Daemon = struct {
     /// resolves once `keys.hold_timeout_ms` pass without more.
     key_input_timer: std.time.Timer,
 
-    /// Owned replacements for opts.name and opts.socket_path after a
-    /// rename; the startup values are borrowed from the caller.
+    /// Owned replacement for opts.name after a rename. The startup
+    /// value is borrowed from the caller.
     owned_name: ?[]u8 = null,
-    owned_socket_path: ?[]u8 = null,
+    /// The name this daemon serves, or null once it has stopped
+    /// accepting clients.
+    claim: ?claimpkg.Claim,
 
     rows: u16,
     cols: u16,
@@ -195,10 +195,12 @@ pub const Daemon = struct {
     sig_read: posix.fd_t = -1,
     quitting: bool = false,
 
-    pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
+    /// Serve the session until it ends, then release `claim`.
+    pub fn run(alloc: std.mem.Allocator, claim: claimpkg.Claim, opts: Options) !void {
         var self: Daemon = .{
             .alloc = alloc,
             .opts = opts,
+            .claim = claim,
             .rows = opts.rows,
             .cols = opts.cols,
             .last_activity_ms = std.time.milliTimestamp(),
@@ -243,19 +245,17 @@ pub const Daemon = struct {
         self.conns.deinit(self.alloc);
         self.retireListener();
         if (self.owned_name) |n| self.alloc.free(n);
-        if (self.owned_socket_path) |p| self.alloc.free(p);
         if (self.sig_read >= 0) posix.close(self.sig_read);
         if (sigchld_pipe >= 0) posix.close(sigchld_pipe);
     }
 
-    /// Close the listening socket and remove its file so new clients
-    /// resolve "no session" instead of connecting to a dying daemon
-    /// and reading EOF.
+    /// Give up the session's name. Its socket goes, so new clients
+    /// resolve "no session" instead of connecting to a dying daemon and
+    /// reading EOF, and a new session may take the name.
     fn retireListener(self: *Daemon) void {
-        if (self.opts.listen_fd < 0) return;
-        posix.close(self.opts.listen_fd);
-        self.opts.listen_fd = -1;
-        std.fs.cwd().deleteFile(self.opts.socket_path) catch {};
+        const claim = self.claim orelse return;
+        claim.release(self.alloc);
+        self.claim = null;
     }
 
     fn loop(self: *Daemon) !void {
@@ -278,7 +278,10 @@ pub const Daemon = struct {
             fds.clearRetainingCapacity();
             refs.clearRetainingCapacity();
 
-            try fds.append(self.alloc, .{ .fd = self.opts.listen_fd, .events = posix.POLL.IN, .revents = 0 });
+            // poll skips a negative fd, so a retired listener needs no
+            // special case.
+            const listen_fd = if (self.claim) |c| c.listen_fd else -1;
+            try fds.append(self.alloc, .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 });
             try refs.append(self.alloc, .listen);
             try fds.append(self.alloc, .{ .fd = self.sig_read, .events = posix.POLL.IN, .revents = 0 });
             try refs.append(self.alloc, .sigchld);
@@ -311,7 +314,7 @@ pub const Daemon = struct {
             for (fds.items, refs.items) |pfd, ref| {
                 if (pfd.revents == 0) continue;
                 switch (ref) {
-                    .listen => self.acceptConn(),
+                    .listen => self.acceptConns(),
                     .sigchld => self.reapChildren(&buf),
                     .conn => |c| {
                         // Drain queued output first so a writable socket
@@ -344,24 +347,32 @@ pub const Daemon = struct {
         self.drainOutbound();
     }
 
-    fn acceptConn(self: *Daemon) void {
-        // Non-blocking so the daemon's writes to this client never
-        // block the loop; output the socket cannot take yet is queued
-        // on the Conn and flushed on POLLOUT.
-        const fd = posix.accept(self.opts.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| {
-            log.warn("accept failed: {}", .{err});
-            return;
-        };
-        const conn = self.alloc.create(Conn) catch {
-            posix.close(fd);
-            return;
-        };
-        conn.* = .{ .alloc = self.alloc, .fd = fd, .decoder = .init(self.alloc) };
-        self.conns.append(self.alloc, conn) catch {
-            posix.close(fd);
-            self.alloc.destroy(conn);
-            return;
-        };
+    /// Accept every connection waiting in the backlog, so a burst of
+    /// clients cannot fill it while the loop serves one per pass.
+    fn acceptConns(self: *Daemon) void {
+        const listen_fd = self.claim.?.listen_fd;
+        while (true) {
+            // Non-blocking so the daemon's writes to this client never
+            // block the loop; output the socket cannot take yet is queued
+            // on the Conn and flushed on POLLOUT.
+            const fd = posix.accept(listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => {
+                    log.warn("accept failed: {}", .{err});
+                    return;
+                },
+            };
+            const conn = self.alloc.create(Conn) catch {
+                posix.close(fd);
+                return;
+            };
+            conn.* = .{ .alloc = self.alloc, .fd = fd, .decoder = .init(self.alloc) };
+            self.conns.append(self.alloc, conn) catch {
+                posix.close(fd);
+                self.alloc.destroy(conn);
+                return;
+            };
+        }
     }
 
     fn reapChildren(self: *Daemon, buf: []u8) void {
@@ -650,11 +661,11 @@ pub const Daemon = struct {
         }
     }
 
-    /// Move the session to a new name by listening on a socket under
-    /// the new name and retiring the old one. Established connections
-    /// survive, and new clients find the session under the new name.
-    /// bind refuses a name that a live session holds. A fresh bind also
-    /// keeps /proc/net/unix naming the socket's real path, which
+    /// Move the session to a new name by claiming the new name and
+    /// retiring the old one. Established connections survive, and new
+    /// clients find the session under the new name. The claim refuses a
+    /// name that a live session holds. A fresh bind also keeps
+    /// /proc/net/unix naming the socket's real path, which
     /// systemd-tmpfiles checks before it ages a socket out of /tmp.
     fn rename(self: *Daemon, conn: *Conn, new_name: []const u8) void {
         paths.validateName(new_name) catch {
@@ -666,35 +677,27 @@ pub const Daemon = struct {
             return;
         }
 
-        const dir = std.fs.path.dirname(self.opts.socket_path) orelse ".";
-        const new_path = paths.socketPath(self.alloc, dir, new_name) catch {
-            conn.send(.err, "rename failed");
-            return;
-        };
+        const dir = std.fs.path.dirname(self.claim.?.socket_path) orelse ".";
         const new_owned_name = self.alloc.dupe(u8, new_name) catch {
-            self.alloc.free(new_path);
             conn.send(.err, "rename failed");
             return;
         };
-
-        const listen_fd = main.bindListen(self.alloc, new_path) catch |err| {
-            self.alloc.free(new_path);
+        const claimed = claimpkg.claim(self.alloc, dir, new_name) catch {
             self.alloc.free(new_owned_name);
-            conn.send(.err, switch (err) {
-                error.SessionExists => "a session with that name already exists",
-                else => "rename failed",
-            });
+            conn.send(.err, "rename failed");
+            return;
+        };
+        const new_claim = claimed orelse {
+            self.alloc.free(new_owned_name);
+            conn.send(.err, "a session with that name already exists");
             return;
         };
         self.retireListener();
-        self.opts.listen_fd = listen_fd;
+        self.claim = new_claim;
 
         if (self.owned_name) |n| self.alloc.free(n);
-        if (self.owned_socket_path) |p| self.alloc.free(p);
         self.owned_name = new_owned_name;
-        self.owned_socket_path = new_path;
         self.opts.name = new_owned_name;
-        self.opts.socket_path = new_path;
         log.info("renamed to {s}", .{new_name});
         conn.send(.ok, "");
     }

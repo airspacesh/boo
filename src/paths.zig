@@ -63,6 +63,14 @@ pub fn socketPath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !
     return std.fs.path.join(alloc, &.{ dir, file });
 }
 
+/// The file whose lock marks `name` as held by a live daemon (see
+/// claim.zig).
+pub fn lockPath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
+    const file = try std.fmt.allocPrint(alloc, "{s}.lock", .{name});
+    defer alloc.free(file);
+    return std.fs.path.join(alloc, &.{ dir, file });
+}
+
 /// Map an arbitrary string onto the session-name character set: bytes
 /// outside the allowed set become '-' and overlong input is truncated.
 /// Returns null when the result still fails validation, e.g. empty input
