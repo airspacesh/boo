@@ -1085,18 +1085,26 @@ fn pumpQuiet(client: *PtyClient) !void {
 }
 
 /// Expect the client's screen, rendered from everything it was sent, to
-/// show what the session's screen holds.
+/// show what the session's screen holds, on the alternate screen the
+/// client draws its canvas in.
 fn expectClientShowsSession(h: *Harness, client: *PtyClient, session: []const u8) !void {
     try pumpQuiet(client);
     const peeked = try h.run(&.{ "peek", session });
     defer h.alloc.free(peeked.stdout);
     defer h.alloc.free(peeked.stderr);
-    const screen = try renderScreen(h.alloc, client.output.items, 24, 80);
+
+    var term = try vt.Terminal.init(h.alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(h.alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(client.output.items);
+    const screen = try term.screens.active.dumpStringAlloc(h.alloc, .{ .screen = .{} });
     defer h.alloc.free(screen);
     try std.testing.expectEqualStrings(
         std.mem.trimRight(u8, peeked.stdout, "\n"),
         std.mem.trimRight(u8, screen, "\n"),
     );
+    try std.testing.expectEqual(.alternate, term.screens.active_key);
 }
 
 test "a repaint while a sequence or character is half written is not garbled by its rest" {
@@ -1140,6 +1148,44 @@ test "a repaint while a sequence or character is half written is not garbled by 
 
     try client.send("\x01d");
     try client.waitFor("detached from torn");
+    _ = try client.waitExit();
+}
+
+test "screen switches that a control byte interrupts, and full resets, never reach the client" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A carriage return inside a toggle is executed and the toggle still
+    // switches screens, in the session's parser and in the client's
+    // terminal alike. A full reset returns to the primary screen.
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "w() {{ while [ ! -e {s}/$1 ]; do sleep 0.02; done; }}; " ++
+            "printf 'PRIMARY'; w g1; printf '\\033[?10\\r49h\\033[HALT'; w g2; " ++
+            "printf '\\033[?10\\r49lBACK'; w g3; printf '\\033[?1049h\\033cRESET'; exec sleep 600",
+        .{h.dir},
+    );
+    defer alloc.free(script);
+    try h.runOk(&.{ "new", "switch", "-d", "--", "sh", "-c", script });
+    const before = try h.waitPeekContains("switch", "PRIMARY");
+    alloc.free(before);
+
+    var client = try PtyClient.spawn(&h, &.{ "attach", "switch" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("PRIMARY");
+    try h.touch("g1");
+    try client.waitFor("ALT");
+    try expectClientShowsSession(&h, &client, "switch");
+    try h.touch("g2");
+    try client.waitFor("BACK");
+    try expectClientShowsSession(&h, &client, "switch");
+    try h.touch("g3");
+    try client.waitFor("RESET");
+    try expectClientShowsSession(&h, &client, "switch");
+
+    try client.send("\x01d");
+    try client.waitFor("detached from switch");
     _ = try client.waitExit();
 }
 

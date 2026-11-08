@@ -17,6 +17,7 @@ const posix = std.posix;
 const protocol = @import("protocol.zig");
 const keys = @import("keys.zig");
 const copymode = @import("copymode.zig");
+const altscreen = @import("altscreen.zig");
 const paths = @import("paths.zig");
 const reap = @import("reap.zig");
 const windowpkg = @import("window.zig");
@@ -752,17 +753,12 @@ pub const Daemon = struct {
             return;
         }
 
-        // Forward raw bytes, minus alternate-screen toggles: the client
-        // canvas cannot switch screens. When the window switches, the
+        // Forward raw bytes, minus screen switches: the client canvas
+        // cannot switch screens. When the window may have switched, the
         // view goes stale, and the rest of the chunk is withheld for the
         // repaint to cover.
-        var out_buf: [32 * 1024 + 32]u8 = undefined;
+        var out_buf: [32 * 1024 + altscreen.held_capacity]u8 = undefined;
         var writer = std.Io.Writer.fixed(&out_buf);
-        // The active screen before this chunk. A switch the filter does
-        // not see (a full reset, RIS, returns to the primary screen
-        // without a 47/1047/1049 toggle) still has to repaint so the
-        // client's `.screen` state stays authoritative.
-        const was_alt = win.onAltScreen();
         // out_buf holds the whole chunk and the bytes the filter held over
         // from the last one.
         const result = win.alt_filter.feed(cleaned, &writer) catch unreachable;
@@ -776,10 +772,7 @@ pub const Daemon = struct {
 
         const filtered = writer.buffered();
         if (filtered.len > 0) conn.send(.output, filtered);
-        // Repaint when the filter stripped a toggle, or when the active
-        // screen changed by a path the filter cannot see (e.g. RIS), so
-        // a fresh repaint and `.screen` reach the client either way.
-        if (result.switched or win.onAltScreen() != was_alt) conn.view = .stale;
+        if (result.switched) conn.view = .stale;
     }
 
     /// Consume the window's bell latch. A bell that rang while no client

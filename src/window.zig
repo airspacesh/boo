@@ -313,13 +313,6 @@ pub const Window = struct {
         return self.term.flags.modify_other_keys_2;
     }
 
-    /// Whether the application is on the alternate screen. The
-    /// passthrough strips screen toggles, so clients cannot tell
-    /// from the byte stream.
-    pub fn onAltScreen(self: *Window) bool {
-        return self.term.screens.active_key == .alternate;
-    }
-
     /// Plain-text dump of the live screen for peek. It reads the active
     /// area, not the viewport that copy mode scrolls into the history.
     pub fn plainScreen(self: *Window, alloc: std.mem.Allocator) ![]const u8 {
