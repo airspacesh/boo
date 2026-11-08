@@ -18,7 +18,7 @@ pub fn validateName(name: []const u8) NameError!void {
 }
 
 /// Resolve the directory that holds session sockets: $BOO_DIR, else
-/// /tmp/boo-<uid>. The directory is created with mode 0700.
+/// /tmp/boo-<uid>. `ensurePrivateDir` makes it ready for use.
 pub fn socketDir(alloc: std.mem.Allocator) ![]u8 {
     return socketDirFrom(alloc, std.posix.getenv("BOO_DIR"));
 }
@@ -29,32 +29,41 @@ pub fn socketDir(alloc: std.mem.Allocator) ![]u8 {
 /// running but unreachable.
 fn socketDirFrom(alloc: std.mem.Allocator, boo_dir: ?[]const u8) ![]u8 {
     if (boo_dir) |d| {
-        if (d.len > 0) {
-            const dir = try alloc.dupe(u8, d);
-            errdefer alloc.free(dir);
-            try ensureDir(dir);
-            return dir;
-        }
+        if (d.len > 0) return alloc.dupe(u8, d);
     }
-    const dir = try std.fmt.allocPrint(alloc, "/tmp/boo-{d}", .{std.c.getuid()});
-    errdefer alloc.free(dir);
-    try ensureDir(dir);
-    return dir;
+    return std.fmt.allocPrint(alloc, "/tmp/boo-{d}", .{std.c.getuid()});
 }
 
-/// Dir.makePath checks an existing directory with statx, which Linux added
-/// in 4.11, so on older kernels every command after the first would fail.
-/// Open the directory first and only make it when it is missing.
-fn ensureDir(dir: []const u8) !void {
-    if (std.fs.cwd().openDir(dir, .{})) |d| {
-        var existing = d;
-        existing.close();
-    } else |err| switch (err) {
-        error.FileNotFound => try std.fs.cwd().makePath(dir),
+/// Check that `dir` is a directory only this user can reach, creating it
+/// and any missing parents with mode 0700 when it is missing. An
+/// existing directory is never changed. One that group or others can
+/// reach is refused (error.OpenToOthers), because another user could
+/// replace a session's socket with their own and read what is typed into
+/// the session. lstat makes a symbolic link, which another user may own
+/// or repoint, error.NotDir.
+pub fn ensurePrivateDir(dir: []const u8) !void {
+    try makeDirs(dir);
+    const st = try std.posix.fstatat(std.posix.AT.FDCWD, dir, std.posix.AT.SYMLINK_NOFOLLOW);
+    if (!std.posix.S.ISDIR(st.mode)) return error.NotDir;
+    if (st.uid != std.c.getuid()) return error.NotOwned;
+    if (st.mode & 0o077 != 0) return error.OpenToOthers;
+}
+
+/// Create `dir` and its missing parents with mode 0700. Calls mkdir(2)
+/// directly, because Dir.makePath checks an existing directory with
+/// statx, which Linux added in 4.11.
+fn makeDirs(dir: []const u8) !void {
+    std.posix.mkdir(dir, 0o700) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        error.FileNotFound => {
+            try makeDirs(std.fs.path.dirname(dir) orelse return err);
+            std.posix.mkdir(dir, 0o700) catch |again| switch (again) {
+                error.PathAlreadyExists => {},
+                else => return again,
+            };
+        },
         else => return err,
-    }
-    // Best effort: sockets must not be reachable by other users.
-    std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o700, 0) catch {};
+    };
 }
 
 pub fn socketPath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
@@ -169,21 +178,11 @@ test "socketPath" {
     try std.testing.expectEqualStrings("/run/gs/work.sock", p);
 }
 
-test "socketDirFrom prefers BOO_DIR and creates it" {
+test "socketDirFrom prefers BOO_DIR" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(base);
-
-    const want = try std.fs.path.join(alloc, &.{ base, "override", "boo" });
-    defer alloc.free(want);
-
-    const dir = try socketDirFrom(alloc, want);
+    const dir = try socketDirFrom(alloc, "/somewhere/boo");
     defer alloc.free(dir);
-    try std.testing.expectEqualStrings(want, dir);
-    var d = try std.fs.cwd().openDir(dir, .{});
-    d.close();
+    try std.testing.expectEqualStrings("/somewhere/boo", dir);
 }
 
 test "socketDirFrom defaults to /tmp/boo-<uid>" {
@@ -194,4 +193,29 @@ test "socketDirFrom defaults to /tmp/boo-<uid>" {
     const dir = try socketDirFrom(alloc, null);
     defer alloc.free(dir);
     try std.testing.expectEqualStrings(want, dir);
+}
+
+test "ensurePrivateDir creates missing parents and refuses a reachable directory" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const nested = try std.fs.path.join(alloc, &.{ base, "a", "b" });
+    defer alloc.free(nested);
+    try ensurePrivateDir(nested);
+    // Running again finds the directory already there.
+    try ensurePrivateDir(nested);
+
+    try std.posix.fchmodat(std.posix.AT.FDCWD, nested, 0o750, 0);
+    try std.testing.expectError(error.OpenToOthers, ensurePrivateDir(nested));
+    // The directory is the user's to fix, so it keeps its mode.
+    const st = try std.posix.fstatat(std.posix.AT.FDCWD, nested, 0);
+    try std.testing.expectEqual(0o750, st.mode & 0o777);
+
+    const file = try std.fs.path.join(alloc, &.{ base, "file" });
+    defer alloc.free(file);
+    try tmp.dir.writeFile(.{ .sub_path = "file", .data = "" });
+    try std.testing.expectError(error.NotDir, ensurePrivateDir(file));
 }

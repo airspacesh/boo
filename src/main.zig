@@ -109,6 +109,31 @@ fn parseDimension(comptime flag: []const u8, value: []const u8) u16 {
     return n;
 }
 
+/// The socket directory, ready to hold sessions. Exits with a message
+/// naming the directory when it cannot.
+fn socketDir(alloc: std.mem.Allocator) ![]u8 {
+    const dir = try paths.socketDir(alloc);
+    paths.ensurePrivateDir(dir) catch |err| switch (err) {
+        error.NotDir => fail(
+            exit_runtime,
+            "socket directory {s} is not a directory (set BOO_DIR to a directory of your own)",
+            .{dir},
+        ),
+        error.NotOwned => fail(
+            exit_runtime,
+            "socket directory {s} belongs to another user (set BOO_DIR to a directory of your own)",
+            .{dir},
+        ),
+        error.OpenToOthers => fail(
+            exit_runtime,
+            "socket directory {s} is open to other users (run 'chmod 700 {s}')",
+            .{ dir, dir },
+        ),
+        else => return err,
+    };
+    return dir;
+}
+
 fn printHelpPage(name: []const u8) !void {
     const entry = help.find(name) orelse unreachable;
     try stdoutWrite(entry.body);
@@ -274,7 +299,7 @@ fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    const dir = try paths.socketDir(alloc);
+    const dir = try socketDir(alloc);
     defer alloc.free(dir);
     return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv), rows, cols, cwd);
 }
@@ -351,7 +376,7 @@ fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
     const want = name_arg orelse usageFail("attach", "a session name is required", .{});
 
-    const dir = try paths.socketDir(alloc);
+    const dir = try socketDir(alloc);
     defer alloc.free(dir);
     const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
@@ -392,7 +417,7 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    const dir = try paths.socketDir(alloc);
+    const dir = try socketDir(alloc);
     defer alloc.free(dir);
     const sessions = try paths.listSessions(alloc, dir);
     defer {
@@ -503,7 +528,7 @@ fn cmdSend(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     const want = name_arg orelse usageFail("send", "a session name is required", .{});
 
     // Resolve the session before potentially blocking on stdin.
-    const dir = try paths.socketDir(alloc);
+    const dir = try socketDir(alloc);
     defer alloc.free(dir);
     const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
@@ -637,7 +662,7 @@ fn cmdPeek(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
     const want = name_arg orelse usageFail("peek", "a session name is required", .{});
 
-    const dir = try paths.socketDir(alloc);
+    const dir = try socketDir(alloc);
     defer alloc.free(dir);
     const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
@@ -712,7 +737,7 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     const timeout_ms = parseDurationMs(timeout_str) orelse
         usageFail("wait", "bad duration '{s}' (use 500ms, 2s, 1m, 4h, 1d)", .{timeout_str});
 
-    const dir = try paths.socketDir(alloc);
+    const dir = try socketDir(alloc);
     defer alloc.free(dir);
     const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
@@ -758,7 +783,7 @@ fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         usageFail("kill", "--all cannot be combined with a session name", .{});
     }
 
-    const dir = try paths.socketDir(alloc);
+    const dir = try socketDir(alloc);
     defer alloc.free(dir);
 
     if (all) {
@@ -808,7 +833,7 @@ fn cmdRename(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     paths.validateName(new_name) catch
         usageFail("rename", "invalid session name '{s}'", .{new_name});
 
-    const dir = try paths.socketDir(alloc);
+    const dir = try socketDir(alloc);
     defer alloc.free(dir);
     const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);

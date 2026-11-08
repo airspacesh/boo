@@ -44,7 +44,8 @@ const Harness = struct {
         const hex = std.fmt.bufPrint(&suffix, "{x}", .{&random_bytes}) catch unreachable;
         const dir = try std.fmt.allocPrint(alloc, "/tmp/bootest-{s}", .{hex});
         errdefer alloc.free(dir);
-        try std.fs.cwd().makePath(dir);
+        // boo refuses a socket directory that other users can reach.
+        try posix.mkdir(dir, 0o700);
         return .{ .alloc = alloc, .dir = dir };
     }
 
@@ -1889,6 +1890,30 @@ test "a live session that refuses connections keeps its socket and name" {
     try h.startDetached("other", &.{"cat"});
     try h.runExit(&.{ "rename", "other", "held" }, 1);
     try std.fs.cwd().access(sock, .{});
+}
+
+test "sockets and their directory are reachable by their owner only" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("priv", &.{"cat"});
+    const sock = try std.fmt.allocPrint(alloc, "{s}/priv.sock", .{h.dir});
+    defer alloc.free(sock);
+    const sock_stat = try posix.fstatat(posix.AT.FDCWD, sock, 0);
+    try std.testing.expectEqual(0, sock_stat.mode & 0o077);
+
+    // A directory that others can reach is refused and left as it is,
+    // because the fix is the user's to make.
+    try posix.fchmodat(posix.AT.FDCWD, h.dir, 0o755, 0);
+    defer posix.fchmodat(posix.AT.FDCWD, h.dir, 0o700, 0) catch {};
+    const ls = try h.run(&.{"ls"});
+    defer alloc.free(ls.stdout);
+    defer alloc.free(ls.stderr);
+    try std.testing.expect(ls.term == .Exited and ls.term.Exited == 1);
+    try std.testing.expect(std.mem.indexOf(u8, ls.stderr, h.dir) != null);
+    const dir_stat = try posix.fstatat(posix.AT.FDCWD, h.dir, 0);
+    try std.testing.expectEqual(0o755, dir_stat.mode & 0o777);
 }
 
 /// Render raw client output through a terminal emulator and return

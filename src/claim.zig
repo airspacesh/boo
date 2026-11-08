@@ -116,8 +116,9 @@ fn unlockFile(fd: posix.fd_t, path: []const u8) void {
     posix.close(fd);
 }
 
-/// Bind and listen on a Unix socket at `path`. Non-blocking, so the
-/// daemon can accept until the backlog is empty.
+/// Bind and listen on a Unix socket at `path` that only this user may
+/// connect to. Non-blocking, so the daemon can accept until the backlog
+/// is empty.
 fn listen(path: []const u8) !posix.fd_t {
     const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, 0);
     errdefer posix.close(fd);
@@ -126,6 +127,12 @@ fn listen(path: []const u8) !posix.fd_t {
     if (path.len >= addr.path.len) return error.NameTooLong;
     @memset(&addr.path, 0);
     @memcpy(addr.path[0..path.len], path);
+    // bind creates the socket file with the umask's permissions, which
+    // may let the group connect, and chmod on a socket fails on some
+    // file systems. The umask is process-wide, but boo is
+    // single-threaded, so nothing else creates a file meanwhile.
+    const umask = std.c.umask(0o177);
+    defer _ = std.c.umask(umask);
     try posix.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
     try posix.listen(fd, std.c.SOMAXCONN);
     return fd;
