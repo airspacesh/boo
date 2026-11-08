@@ -2004,6 +2004,23 @@ test "a daemon out of descriptors backs off instead of spinning on accept" {
     try std.testing.expect(failures < 50);
 }
 
+test "a socket path too long for a Unix socket is reported, not raised" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A socket directory under h.dir, so h cleans it up, whose sockets
+    // cannot fit in a Unix socket address.
+    const deep_dir = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ h.dir, "d" ** 80 });
+    defer alloc.free(deep_dir);
+    var deep: Harness = .{ .alloc = alloc, .dir = deep_dir };
+    const result = try deep.run(&.{ "new", "toolong", "-d", "--", "cat" });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try std.testing.expect(result.term == .Exited and result.term.Exited == 1);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "toolong.sock") != null);
+}
+
 /// Stand in for a live daemon that refuses connections, as one does
 /// between bind and listen or with a full backlog. Holds the session's
 /// lock (see src/claim.zig) and binds its socket without listening.

@@ -179,6 +179,19 @@ fn resolvePrefix(
     fail(exit_no_session, "no session matching '{s}' (run 'boo ls')", .{want});
 }
 
+/// Exit with a message when the socket for `name` in `dir` is too long
+/// for a Unix socket address, which bind would refuse.
+fn requireSocketPathFits(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
+    const sock = try paths.socketPath(alloc, dir, name);
+    defer alloc.free(sock);
+    if (sock.len <= paths.max_socket_path_len) return;
+    fail(
+        exit_runtime,
+        "socket path {s} is {d} bytes, over the {d} a Unix socket allows (use a shorter name or set BOO_DIR to a shorter directory)",
+        .{ sock, sock.len, paths.max_socket_path_len },
+    );
+}
+
 /// Check that `name` is exactly the name of an existing session, as
 /// every command but attach requires. Exits with code 3 otherwise.
 fn requireSession(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
@@ -372,6 +385,7 @@ fn createSession(
             fail(exit_runtime, "--cwd {s}: cannot resolve directory", .{d});
     } else null;
 
+    try requireSocketPathFits(alloc, dir, name);
     const session = try claimpkg.claim(alloc, dir, name) orelse fail(
         exit_runtime,
         "session {s} already exists (run 'boo attach {s}')",
@@ -901,6 +915,7 @@ fn cmdRename(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     const dir = try socketDir(alloc);
     defer alloc.free(dir);
     try requireSession(alloc, dir, name);
+    try requireSocketPathFits(alloc, dir, new_name);
 
     const result = try mustControl(alloc, dir, name, &.{ "rename", new_name });
     defer alloc.free(result.text);

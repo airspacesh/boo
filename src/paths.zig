@@ -66,6 +66,10 @@ fn makeDirs(dir: []const u8) !void {
     };
 }
 
+/// The longest path a Unix socket address holds, not counting its NUL.
+/// That is 103 bytes on macOS and 107 on Linux.
+pub const max_socket_path_len = @typeInfo(@FieldType(std.posix.sockaddr.un, "path")).array.len - 1;
+
 pub fn socketPath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
     const file = try std.fmt.allocPrint(alloc, "{s}.sock", .{name});
     defer alloc.free(file);
