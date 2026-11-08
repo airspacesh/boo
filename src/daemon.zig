@@ -166,6 +166,26 @@ fn monotonicMs() i64 {
     return ts.sec * std.time.ms_per_s + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
 
+/// Append the UTF-8 `text` without the control characters a terminal
+/// acts on: C0, DEL, and C1, which some terminals take as ESC
+/// sequences. ls prints the result, so a bad byte would reach the
+/// user's terminal. Bytes that are not UTF-8 are dropped too.
+fn appendPrintable(alloc: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            i += 1;
+            continue;
+        };
+        const end = @min(i + len, text.len);
+        const char = text[i..end];
+        i = end;
+        const cp = std.unicode.utf8Decode(char) catch continue;
+        if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) continue;
+        try out.appendSlice(alloc, char);
+    }
+}
+
 var sigchld_pipe: posix.fd_t = -1;
 
 fn handleSigchld(_: c_int) callconv(.c) void {
@@ -629,10 +649,7 @@ pub const Daemon = struct {
                     cursor.y + 1,
                     cursor.x + 1,
                 });
-                for (w.title()) |byte| {
-                    if (byte < 0x20 or byte == 0x7f) continue;
-                    try out.append(self.alloc, byte);
-                }
+                try appendPrintable(self.alloc, &out, w.title());
                 try out.append(self.alloc, '\n');
                 try out.appendSlice(self.alloc, text);
                 conn.send(.ok, out.items);
@@ -670,10 +687,7 @@ pub const Daemon = struct {
             // Window title last; sanitized, so it cannot contain the
             // tabs that separate the fields.
             if (self.liveWindow()) |w| {
-                for (w.title()) |byte| {
-                    if (byte < 0x20 or byte == 0x7f) continue;
-                    try out.append(self.alloc, byte);
-                }
+                try appendPrintable(self.alloc, &out, w.title());
             }
             conn.send(.ok, out.items);
         } else if (std.mem.eql(u8, cmd, "rename")) {
@@ -1038,6 +1052,14 @@ pub const Daemon = struct {
         conn.send(.output, seq);
     }
 };
+
+test "appendPrintable drops C0, DEL, C1, and bytes that are not UTF-8" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try appendPrintable(alloc, &out, "a\tb\x7fc\u{9b}2J\xffd\u{e9}\u{1f47b}");
+    try std.testing.expectEqualStrings("abc2Jd\u{e9}\u{1f47b}", out.items);
+}
 
 test "Conn.send queues output without blocking and flushes in order" {
     const alloc = std.testing.allocator;
