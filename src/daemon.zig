@@ -17,7 +17,6 @@ const posix = std.posix;
 const protocol = @import("protocol.zig");
 const keys = @import("keys.zig");
 const copymode = @import("copymode.zig");
-const altscreen = @import("altscreen.zig");
 const paths = @import("paths.zig");
 const reap = @import("reap.zig");
 const windowpkg = @import("window.zig");
@@ -59,6 +58,11 @@ const View = enum {
     /// that reads slowly gets one frame of the latest state instead of a
     /// backlog it would only see the end of.
     stale,
+    /// A frame went out while the window's parser was partway through a
+    /// sequence or character. The rest of it would garble the fresh
+    /// canvas, so output is withheld until the parser has finished it,
+    /// and then the canvas gets another frame.
+    torn,
 };
 
 const Conn = struct {
@@ -742,7 +746,7 @@ pub const Daemon = struct {
         // A client this far behind gets a frame once it has caught up,
         // instead of more output.
         if (conn.behind()) conn.view = .stale;
-        if (conn.view == .stale) {
+        if (conn.view != .current) {
             win.feedDiscarded(cleaned);
             self.noteBell(win, detached, now);
             return;
@@ -750,8 +754,8 @@ pub const Daemon = struct {
 
         // Forward raw bytes, minus alternate-screen toggles: the client
         // canvas cannot switch screens. When the window switches, the
-        // rest of the chunk is dropped and the new active screen is
-        // repainted from terminal state.
+        // view goes stale, and the rest of the chunk is withheld for the
+        // repaint to cover.
         var out_buf: [32 * 1024 + 32]u8 = undefined;
         var writer = std.Io.Writer.fixed(&out_buf);
         // The active screen before this chunk. A switch the filter does
@@ -759,16 +763,15 @@ pub const Daemon = struct {
         // without a 47/1047/1049 toggle) still has to repaint so the
         // client's `.screen` state stays authoritative.
         const was_alt = win.onAltScreen();
-        const result = win.alt_filter.feed(cleaned, &writer) catch
-            altscreen.Filter.Result{ .switched = true, .discard_start = 0 };
+        // out_buf holds the whole chunk and the bytes the filter held over
+        // from the last one.
+        const result = win.alt_filter.feed(cleaned, &writer) catch unreachable;
 
-        // Bytes up to the discard point reach the client's real
-        // terminal, which answers any queries among them. The repaint
-        // re-renders the discarded tail from terminal state, but it
-        // cannot answer queries, so the window must.
-        const split = result.discard_start orelse cleaned.len;
-        win.feed(cleaned[0..split]);
-        if (split < cleaned.len) win.feedDiscarded(cleaned[split..]);
+        // Bytes up to the toggle reach the client's real terminal, which
+        // answers any queries among them. The repaint covers the rest, but
+        // it cannot answer queries, so the window must.
+        win.feed(cleaned[0..result.consumed]);
+        win.feedDiscarded(cleaned[result.consumed..]);
         self.noteBell(win, detached, now);
 
         const filtered = writer.buffered();
@@ -900,11 +903,17 @@ pub const Daemon = struct {
         return "";
     }
 
-    /// Send a stale canvas its fresh frame once the client has read
-    /// everything queued: a repaint, or in copy mode the viewport.
+    /// Send a stale or torn canvas its fresh frame once it is due (see
+    /// `View`): a repaint, or in copy mode the viewport.
     fn sendFrame(self: *Daemon, conn: *Conn) void {
-        if (conn.view != .stale or conn.out.items.len > 0) return;
+        if (conn.out.items.len > 0) return;
         const win = self.liveWindow() orelse return;
+        switch (conn.view) {
+            .current => return,
+            .stale => {},
+            .torn => if (!win.atGround()) return,
+        }
+
         const bytes = (if (conn.copy_mode)
             win.copyModeFrame(self.alloc)
         else
@@ -916,7 +925,7 @@ pub const Daemon = struct {
         // The frame covers everything fed so far, so passthrough resumes
         // from a clean slate.
         win.alt_filter.reset();
-        conn.view = .current;
+        conn.view = if (win.atGround()) .current else .torn;
         conn.send(.output, bytes);
     }
 

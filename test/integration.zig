@@ -147,6 +147,14 @@ const Harness = struct {
         }
     }
 
+    /// Create an empty file in the test directory, as a go signal for a
+    /// session script that waits for it.
+    fn touch(self: *Harness, name: []const u8) !void {
+        var dir = try std.fs.cwd().openDir(self.dir, .{});
+        defer dir.close();
+        try dir.writeFile(.{ .sub_path = name, .data = "" });
+    }
+
     /// Type text into the session, followed by Enter.
     fn sendLine(self: *Harness, session: []const u8, text: []const u8) !void {
         try self.runOk(&.{ "send", session, "--text", text, "--enter" });
@@ -1069,6 +1077,70 @@ test "queries in a discarded passthrough span are answered" {
 
     try std.fs.cwd().writeFile(.{ .sub_path = go_path, .data = "" });
     try client.waitFor("CPR-ANSWERED");
+}
+
+/// Read client output until none arrives for 200 ms.
+fn pumpQuiet(client: *PtyClient) !void {
+    while (try client.pump(200)) {}
+}
+
+/// Expect the client's screen, rendered from everything it was sent, to
+/// show what the session's screen holds.
+fn expectClientShowsSession(h: *Harness, client: *PtyClient, session: []const u8) !void {
+    try pumpQuiet(client);
+    const peeked = try h.run(&.{ "peek", session });
+    defer h.alloc.free(peeked.stdout);
+    defer h.alloc.free(peeked.stderr);
+    const screen = try renderScreen(h.alloc, client.output.items, 24, 80);
+    defer h.alloc.free(screen);
+    try std.testing.expectEqualStrings(
+        std.mem.trimRight(u8, peeked.stdout, "\n"),
+        std.mem.trimRight(u8, screen, "\n"),
+    );
+}
+
+test "a repaint while a sequence or character is half written is not garbled by its rest" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The session stops partway through an SGR sequence, and later partway
+    // through the UTF-8 bytes of a character, each time until the test
+    // signals it to go on.
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "w() {{ while [ ! -e {s}/$1 ]; do sleep 0.02; done; }}; " ++
+            "printf 'BEFORE \\033[3'; w g1; printf '1mRED\\033[0m '; w g2; " ++
+            "printf 'MID \\342\\224'; w g3; printf '\\200 AFTER'; exec sleep 600",
+        .{h.dir},
+    );
+    defer alloc.free(script);
+    try h.runOk(&.{ "new", "torn", "-d", "--", "sh", "-c", script });
+    const before = try h.waitPeekContains("torn", "BEFORE");
+    alloc.free(before);
+
+    // Attaching repaints the screen while the parser is inside the SGR
+    // sequence. Its rest, "1m", must not reach the canvas as text.
+    var client = try PtyClient.spawn(&h, &.{ "attach", "torn" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("BEFORE");
+    try h.touch("g1");
+    try client.waitFor("RED");
+    try expectClientShowsSession(&h, &client, "torn");
+
+    // Redrawing while the parser holds two bytes of a three-byte character
+    // must not leave its last byte to print as an invalid one.
+    try h.touch("g2");
+    try client.waitFor("MID");
+    try client.send("\x01l");
+    try pumpQuiet(&client);
+    try h.touch("g3");
+    try client.waitFor("AFTER");
+    try expectClientShowsSession(&h, &client, "torn");
+
+    try client.send("\x01d");
+    try client.waitFor("detached from torn");
+    _ = try client.waitExit();
 }
 
 test "reattach restores the window title" {

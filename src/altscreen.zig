@@ -22,14 +22,7 @@ fn isAltScreenMode(param: u16) bool {
 /// text pass through unchanged. Candidate sequences split across feeds
 /// are carried over to the next call.
 pub const Filter = struct {
-    /// When true, everything after a removed toggle is consumed
-    /// without being emitted until `reset` is called. The caller is
-    /// expected to follow up with a full repaint that covers the
-    /// discarded bytes and to reset the filter at that point.
-    discard_after_switch: bool = false,
-
     state: State = .ground,
-    discarding: bool = false,
     /// Candidate sequence bytes held across feeds. Alt-screen toggles
     /// are short; anything that outgrows the buffer is flushed
     /// verbatim and ignored.
@@ -39,30 +32,22 @@ pub const Filter = struct {
     const State = enum { ground, esc, csi, params };
 
     pub const Result = struct {
-        /// At least one alternate-screen toggle was removed: the
-        /// active screen may have changed and the client needs a
-        /// repaint.
+        /// How much of the input was scanned: all of it, or up to the end
+        /// of a removed toggle.
+        consumed: usize,
+        /// The scan stopped at a removed toggle: the active screen may
+        /// have changed and the client needs a repaint.
         switched: bool = false,
-        /// Index into the input of the first byte consumed without
-        /// being emitted, when `discard_after_switch` is active.
-        /// Discarded bytes never reach the client's terminal, so
-        /// side effects they carry (query responses) must be
-        /// produced by the caller instead.
-        discard_start: ?usize = null,
     };
 
-    /// Scan `input`, writing passthrough bytes to `writer`. Reports
-    /// removed toggles and the start of any discarded tail.
+    /// Scan `input`, writing passthrough bytes to `writer`, until the end
+    /// of the input or of the first alternate-screen toggle, which is
+    /// removed.
     pub fn feed(
         self: *Filter,
         input: []const u8,
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!Result {
-        var result: Result = .{
-            // Still discarding from a previous feed: the whole input
-            // is consumed silently.
-            .discard_start = if (self.discarding) 0 else null,
-        };
         var run_start: usize = 0;
         var i: usize = 0;
         while (i < input.len) : (i += 1) {
@@ -70,7 +55,7 @@ pub const Filter = struct {
             switch (self.state) {
                 .ground => {
                     if (byte == 0x1b) {
-                        try self.emit(writer, input[run_start..i]);
+                        try writer.writeAll(input[run_start..i]);
                         self.hold(byte);
                         self.state = .esc;
                     }
@@ -128,16 +113,10 @@ pub const Filter = struct {
                             // follow-up repaint re-emits the other
                             // modes from terminal state.
                             self.len = 0;
-                            result.switched = true;
-                            if (self.discard_after_switch) {
-                                self.discarding = true;
-                                if (result.discard_start == null) {
-                                    result.discard_start = i + 1;
-                                }
-                            }
+                            return .{ .consumed = i + 1, .switched = true };
                         } else {
                             try self.flush(writer);
-                            try self.emit(writer, &.{byte});
+                            try writer.writeByte(byte);
                         }
                         run_start = i + 1;
                     },
@@ -158,17 +137,16 @@ pub const Filter = struct {
             }
         }
         if (self.state == .ground) {
-            try self.emit(writer, input[run_start..]);
+            try writer.writeAll(input[run_start..]);
         }
-        return result;
+        return .{ .consumed = input.len };
     }
 
-    /// Forget held bytes and scanning state, and resume emitting. Used
-    /// when a repaint replaces the passthrough stream.
+    /// Forget held bytes and scanning state. Used when a repaint replaces
+    /// the passthrough stream.
     pub fn reset(self: *Filter) void {
         self.state = .ground;
         self.len = 0;
-        self.discarding = false;
     }
 
     fn hold(self: *Filter, byte: u8) void {
@@ -176,13 +154,8 @@ pub const Filter = struct {
         self.len += 1;
     }
 
-    fn emit(self: *Filter, writer: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
-        if (self.discarding or bytes.len == 0) return;
-        try writer.writeAll(bytes);
-    }
-
     fn flush(self: *Filter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try self.emit(writer, self.buf[0..self.len]);
+        try writer.writeAll(self.buf[0..self.len]);
         self.len = 0;
     }
 
@@ -197,79 +170,69 @@ pub const Filter = struct {
     }
 };
 
-fn testFeed(filter: *Filter, input: []const u8, expected: []const u8, result: Filter.Result) !void {
+/// Feed `input` through the filter until it is all consumed, and expect
+/// the passthrough bytes and the number of toggles removed.
+fn testFeed(filter: *Filter, input: []const u8, expected: []const u8, switches: usize) !void {
     var buf: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
-    const got = try filter.feed(input, &writer);
+    var rest = input;
+    var got_switches: usize = 0;
+    while (rest.len > 0) {
+        const result = try filter.feed(rest, &writer);
+        if (result.switched) got_switches += 1;
+        rest = rest[result.consumed..];
+    }
     try std.testing.expectEqualStrings(expected, writer.buffered());
-    try std.testing.expectEqual(result.switched, got.switched);
-    try std.testing.expectEqual(result.discard_start, got.discard_start);
+    try std.testing.expectEqual(switches, got_switches);
 }
 
 test "plain text and ordinary sequences pass through" {
     var f: Filter = .{};
-    try testFeed(&f, "hello \x1b[2J\x1b[1;5H\x1b[31mworld", "hello \x1b[2J\x1b[1;5H\x1b[31mworld", .{});
+    try testFeed(&f, "hello \x1b[2J\x1b[1;5H\x1b[31mworld", "hello \x1b[2J\x1b[1;5H\x1b[31mworld", 0);
 }
 
 test "non-screen private modes pass through" {
     var f: Filter = .{};
-    try testFeed(&f, "\x1b[?25l\x1b[?2004h\x1b[?1000h", "\x1b[?25l\x1b[?2004h\x1b[?1000h", .{});
+    try testFeed(&f, "\x1b[?25l\x1b[?2004h\x1b[?1000h", "\x1b[?25l\x1b[?2004h\x1b[?1000h", 0);
 }
 
 test "alt screen toggles are removed" {
     var f: Filter = .{};
-    try testFeed(&f, "a\x1b[?1049hb", "ab", .{ .switched = true });
-    try testFeed(&f, "c\x1b[?1049ld", "cd", .{ .switched = true });
-    try testFeed(&f, "\x1b[?47h\x1b[?1047l", "", .{ .switched = true });
+    try testFeed(&f, "a\x1b[?1049hb", "ab", 1);
+    try testFeed(&f, "c\x1b[?1049ld", "cd", 1);
+    try testFeed(&f, "\x1b[?47h\x1b[?1047l", "", 2);
 }
 
 test "mixed parameter list containing alt mode is removed" {
     var f: Filter = .{};
-    try testFeed(&f, "\x1b[?25;1049h", "", .{ .switched = true });
+    try testFeed(&f, "\x1b[?25;1049h", "", 1);
 }
 
 test "sequence split across feeds" {
     var f: Filter = .{};
-    try testFeed(&f, "x\x1b[?10", "x", .{});
-    try testFeed(&f, "49h y", " y", .{ .switched = true });
-    try testFeed(&f, "\x1b", "", .{});
-    try testFeed(&f, "[?25h", "\x1b[?25h", .{});
+    try testFeed(&f, "x\x1b[?10", "x", 0);
+    try testFeed(&f, "49h y", " y", 1);
+    try testFeed(&f, "\x1b", "", 0);
+    try testFeed(&f, "[?25h", "\x1b[?25h", 0);
 }
 
-test "discard after switch suppresses the rest of the feed" {
-    var f: Filter = .{ .discard_after_switch = true };
-    // "before" is 6 bytes and the toggle is 8 more; discarding
-    // begins right after the toggle's final byte.
-    try testFeed(&f, "before\x1b[?1049hafter\x1b[2J", "before", .{
-        .switched = true,
-        .discard_start = 14,
-    });
-    // Still discarding: the whole next feed is consumed.
-    try testFeed(&f, "more", "", .{ .discard_start = 0 });
-    // The next feed after a reset resumes normal emission.
-    f.reset();
-    try testFeed(&f, "next", "next", .{});
-}
-
-test "discard start tracks a toggle split across feeds" {
-    var f: Filter = .{ .discard_after_switch = true };
-    try testFeed(&f, "ab\x1b[?10", "ab", .{});
-    // The toggle completes at the 'h' (index 2); "XY" is discarded.
-    try testFeed(&f, "49hXY", "", .{ .switched = true, .discard_start = 3 });
-}
-
-test "plain mode never reports a discard start" {
+test "a scan stops at the end of a removed toggle" {
     var f: Filter = .{};
-    try testFeed(&f, "\x1b[?1049hrest", "rest", .{ .switched = true });
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    // "before" is 6 bytes and the toggle 8 more.
+    const result = try f.feed("before\x1b[?1049hafter", &writer);
+    try std.testing.expectEqualStrings("before", writer.buffered());
+    try std.testing.expectEqual(Filter.Result{ .consumed = 14, .switched = true }, result);
 }
 
 test "overlong parameter list is flushed verbatim" {
     var f: Filter = .{};
     const long = "\x1b[?1;2;3;4;5;6;7;8;9;10;11;12h";
-    try testFeed(&f, long, long, .{});
+    try testFeed(&f, long, long, 0);
 }
 
 test "DECRQM style sequences pass through" {
     var f: Filter = .{};
-    try testFeed(&f, "\x1b[?1049$p", "\x1b[?1049$p", .{});
+    try testFeed(&f, "\x1b[?1049$p", "\x1b[?1049$p", 0);
 }

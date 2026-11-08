@@ -66,7 +66,7 @@ pub const Window = struct {
 
     /// Strips alternate-screen toggles from passthrough output; the
     /// daemon repaints from terminal state on screen switches instead.
-    alt_filter: altscreen.Filter = .{ .discard_after_switch = true },
+    alt_filter: altscreen.Filter = .{},
 
     term: vt.Terminal,
     stream: Stream,
@@ -216,14 +216,21 @@ pub const Window = struct {
     }
 
     /// Feed child output that was dropped from the passthrough stream
-    /// (everything after an alternate-screen switch until the repaint).
-    /// The client's real terminal never sees these bytes, so queries in
-    /// them must be answered by the daemon or the application blocks
-    /// waiting for a response that nobody sends.
+    /// because a repaint will cover it. The client's real terminal never
+    /// sees these bytes, so queries in them must be answered by the daemon
+    /// or the application blocks waiting for a response that nobody sends.
     pub fn feedDiscarded(self: *Window, bytes: []const u8) void {
         self.feeding_discarded = true;
         defer self.feeding_discarded = false;
         self.stream.nextSlice(bytes);
+    }
+
+    /// Whether the parser has finished every sequence and character fed so
+    /// far. Until it has, the rest of one is still to come, and those bytes
+    /// would garble a canvas that a repaint has just drawn fresh.
+    pub fn atGround(self: *const Window) bool {
+        // The UTF-8 decoder's state is 0 between characters.
+        return self.stream.parser.state == .ground and self.stream.utf8decoder.state == 0;
     }
 
     pub fn writeInput(self: *Window, bytes: []const u8) !void {
@@ -364,7 +371,8 @@ pub const Window = struct {
         // window switches.
         try writeTitle(self.title(), &out.writer);
         var filter: altscreen.Filter = .{};
-        _ = try filter.feed(raw.writer.buffered(), &out.writer);
+        var rest = raw.writer.buffered();
+        while (rest.len > 0) rest = rest[(try filter.feed(rest, &out.writer)).consumed..];
 
         // Tabstop and scrolling-region rehydration is emitted after the
         // screen extras and moves the cursor, so position it last.
