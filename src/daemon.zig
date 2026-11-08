@@ -166,26 +166,6 @@ fn monotonicMs() i64 {
     return ts.sec * std.time.ms_per_s + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
 
-/// Append the UTF-8 `text` without the control characters a terminal
-/// acts on: C0, DEL, and C1, which some terminals take as ESC
-/// sequences. ls prints the result, so a bad byte would reach the
-/// user's terminal. Bytes that are not UTF-8 are dropped too.
-fn appendPrintable(alloc: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
-    var i: usize = 0;
-    while (i < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
-            i += 1;
-            continue;
-        };
-        const end = @min(i + len, text.len);
-        const char = text[i..end];
-        i = end;
-        const cp = std.unicode.utf8Decode(char) catch continue;
-        if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) continue;
-        try out.appendSlice(alloc, char);
-    }
-}
-
 var sigchld_pipe: posix.fd_t = -1;
 
 fn handleSigchld(_: c_int) callconv(.c) void {
@@ -649,19 +629,19 @@ pub const Daemon = struct {
                 // Header line with window metadata, then the dump. The
                 // title is sanitized so it cannot contain the newline
                 // that terminates the header.
-                var out: std.ArrayList(u8) = .empty;
-                defer out.deinit(self.alloc);
+                var out: std.Io.Writer.Allocating = .init(self.alloc);
+                defer out.deinit();
                 const cursor = &w.term.screens.active.cursor;
-                try out.print(self.alloc, "{d}\t{d}\t{d}\t{d}\t", .{
+                try out.writer.print("{d}\t{d}\t{d}\t{d}\t", .{
                     self.rows,
                     self.cols,
                     cursor.y + 1,
                     cursor.x + 1,
                 });
-                try appendPrintable(self.alloc, &out, w.title());
-                try out.append(self.alloc, '\n');
-                try out.appendSlice(self.alloc, text);
-                conn.send(.ok, out.items);
+                try windowpkg.writePrintable(w.title(), &out.writer);
+                try out.writer.writeByte('\n');
+                try out.writer.writeAll(text);
+                conn.send(.ok, out.written());
             } else conn.send(.err, "no window");
         } else if (std.mem.eql(u8, cmd, "info")) {
             var attached = false;
@@ -682,9 +662,9 @@ pub const Daemon = struct {
                 -1;
             // The session command's pid, or -1 once it has exited.
             const pid: posix.pid_t = if (self.liveWindow()) |w| w.child_pid else -1;
-            var out: std.ArrayList(u8) = .empty;
-            defer out.deinit(self.alloc);
-            try out.print(self.alloc, "{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t", .{
+            var out: std.Io.Writer.Allocating = .init(self.alloc);
+            defer out.deinit();
+            try out.writer.print("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t", .{
                 self.opts.name,
                 if (attached) "Attached" else "Detached",
                 idle,
@@ -696,9 +676,9 @@ pub const Daemon = struct {
             // Window title last; sanitized, so it cannot contain the
             // tabs that separate the fields.
             if (self.liveWindow()) |w| {
-                try appendPrintable(self.alloc, &out, w.title());
+                try windowpkg.writePrintable(w.title(), &out.writer);
             }
-            conn.send(.ok, out.items);
+            conn.send(.ok, out.written());
         } else if (std.mem.eql(u8, cmd, "rename")) {
             if (argv.len != 2) {
                 conn.send(.err, "usage: rename <new-name>");
@@ -1061,14 +1041,6 @@ pub const Daemon = struct {
         conn.send(.output, seq);
     }
 };
-
-test "appendPrintable drops C0, DEL, C1, and bytes that are not UTF-8" {
-    const alloc = std.testing.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-    try appendPrintable(alloc, &out, "a\tb\x7fc\u{9b}2J\xffd\u{e9}\u{1f47b}");
-    try std.testing.expectEqualStrings("abc2Jd\u{e9}\u{1f47b}", out.items);
-}
 
 test "Conn.send queues output without blocking and flushes in order" {
     const alloc = std.testing.allocator;

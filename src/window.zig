@@ -491,14 +491,31 @@ pub const Window = struct {
     }
 };
 
-/// OSC 2: set the client terminal's window title. Control bytes are
-/// dropped so the title text cannot terminate or corrupt the sequence.
+/// Write the UTF-8 `text` without the control characters a terminal
+/// acts on: C0, DEL, and C1, which some terminals take as ESC sequences.
+/// Bytes that are not UTF-8 are dropped too. A title passes through this
+/// on its way to any terminal, so it cannot break out of the sequence or
+/// the listing that carries it.
+pub fn writePrintable(text: []const u8, writer: *std.Io.Writer) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            i += 1;
+            continue;
+        };
+        const end = @min(i + len, text.len);
+        const char = text[i..end];
+        i = end;
+        const cp = std.unicode.utf8Decode(char) catch continue;
+        if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) continue;
+        try writer.writeAll(char);
+    }
+}
+
+/// OSC 2: set the client terminal's window title.
 fn writeTitle(title: []const u8, writer: *std.Io.Writer) !void {
     try writer.writeAll("\x1b]2;");
-    for (title) |byte| {
-        if (byte < 0x20 or byte == 0x7f) continue;
-        try writer.writeByte(byte);
-    }
+    try writePrintable(title, writer);
     try writer.writeByte(0x07);
 }
 
@@ -695,8 +712,15 @@ test "title set via OSC is tracked and emitted sanitized" {
 
     // Control bytes in a title cannot break out of the sequence.
     writer = std.Io.Writer.fixed(&buf);
-    try writeTitle("a\x1b\x07b\x7f!", &writer);
-    try std.testing.expectEqualStrings("\x1b]2;ab!\x07", writer.buffered());
+    try writeTitle("a\x1b\x07b\x7f!\u{9b}2J", &writer);
+    try std.testing.expectEqualStrings("\x1b]2;ab!2J\x07", writer.buffered());
+}
+
+test "writePrintable drops C0, DEL, C1, and bytes that are not UTF-8" {
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try writePrintable("a\tb\x7fc\u{9b}2J\xffd\u{e9}\u{1f47b}", &writer);
+    try std.testing.expectEqualStrings("abc2Jd\u{e9}\u{1f47b}", writer.buffered());
 }
 
 /// Build a childless window whose PTY master is the write end of a pipe,
