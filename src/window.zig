@@ -358,7 +358,7 @@ pub const Window = struct {
         // active screen, so screen toggles must never reach it.
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try out.writer.writeAll(sanitize_sequence);
+        try out.writer.writeAll(begin_sync ++ sanitize_sequence);
         // The formatter does not emit the title, so without this the
         // client terminal's title would go stale across reattach and
         // window switches.
@@ -369,6 +369,7 @@ pub const Window = struct {
         // Tabstop and scrolling-region rehydration is emitted after the
         // screen extras and moves the cursor, so position it last.
         try self.writeCursorPos(&out.writer);
+        try out.writer.writeAll(end_sync);
 
         return alloc.dupe(u8, out.writer.buffered());
     }
@@ -380,7 +381,7 @@ pub const Window = struct {
     pub fn copyModeFrame(self: *Window, alloc: std.mem.Allocator) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try out.writer.writeAll(sanitize_sequence ++ "\x1b[?25l");
+        try out.writer.writeAll(begin_sync ++ sanitize_sequence ++ "\x1b[?25l");
 
         var formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
         formatter.content = .{ .selection = self.areaSelection(.viewport) };
@@ -396,6 +397,7 @@ pub const Window = struct {
         });
         const tag_col = self.term.cols -| tag.len + 1;
         try out.writer.print("\x1b[0m\x1b[1;{d}H\x1b[7m{s}\x1b[0m", .{ tag_col, tag });
+        try out.writer.writeAll(end_sync);
 
         return alloc.dupe(u8, out.writer.buffered());
     }
@@ -465,6 +467,12 @@ pub const reset_state_sequence =
 /// canvas is the client terminal's own alternate screen, so no screen
 /// toggles belong here.
 pub const sanitize_sequence = reset_state_sequence ++ "\x1b[H\x1b[2J";
+
+/// Synchronized output (mode 2026) around a frame: the client terminal
+/// shows the frame only once it is complete, so the clear that starts
+/// it never flashes on screen.
+const begin_sync = "\x1b[?2026h";
+const end_sync = "\x1b[?2026l";
 
 test "window state machine without a child" {
     // Exercise the terminal+stream wiring directly (no PTY): construct
