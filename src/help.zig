@@ -47,8 +47,9 @@ pub const overview =
     \\driving boo from scripts, or 'boo help --all' for every page.
     \\
     \\session selection:
-    \\  Commands taking <name> accept a unique prefix of the session
-    \\  name (e.g. 'boo attach bu' for "build").
+    \\  attach accepts a unique prefix of the session name (e.g.
+    \\  'boo attach bu' for "build"). Other commands take the exact
+    \\  name.
     \\
     \\environment:
     \\  BOO_DIR  socket directory
@@ -225,8 +226,7 @@ pub const commands = [_]Entry{
         \\usage: boo rename <name> <new-name>
         \\
         \\Rename a session. The running program is unaffected and an
-        \\attached client stays attached. The old name accepts a
-        \\unique prefix, like attach.
+        \\attached client stays attached.
         \\
         \\example:
         \\  boo rename work api-server
@@ -332,8 +332,6 @@ pub const topics = [_]Entry{
         \\tips:
         \\  - Sessions are cheap; use one session per task.
         \\  - 'boo new -d' prints the session name on stdout.
-        \\  - Pick unique session names so [name] prefixes stay
-        \\    unambiguous.
         \\
         ,
     },

@@ -150,9 +150,10 @@ fn joinNames(alloc: std.mem.Allocator, names: []const []u8) []const u8 {
     return out.items;
 }
 
-/// Resolve a session name to an owned, existing session name.
-/// Accepts unique prefixes. Exits with code 3 when nothing matches.
-fn resolveSession(
+/// Resolve a unique prefix of a session name, which attach accepts, to
+/// an owned, existing session name. Exits with code 3 when no session or
+/// more than one matches.
+fn resolvePrefix(
     alloc: std.mem.Allocator,
     dir: []const u8,
     want: []const u8,
@@ -166,19 +167,27 @@ fn resolveSession(
     for (sessions) |s| {
         if (std.mem.eql(u8, s, want)) return alloc.dupe(u8, s);
     }
-    var match: ?[]const u8 = null;
-    var count: usize = 0;
+    var matches: std.ArrayList([]u8) = .empty;
+    defer matches.deinit(alloc);
     for (sessions) |s| {
-        if (std.mem.startsWith(u8, s, want)) {
-            match = s;
-            count += 1;
-        }
+        if (std.mem.startsWith(u8, s, want)) try matches.append(alloc, s);
     }
-    if (count == 1) return alloc.dupe(u8, match.?);
-    if (count > 1) fail(exit_no_session, "ambiguous session '{s}': matches {s}", .{
-        want, joinNames(alloc, sessions),
+    if (matches.items.len == 1) return alloc.dupe(u8, matches.items[0]);
+    if (matches.items.len > 1) fail(exit_no_session, "ambiguous session '{s}': matches {s}", .{
+        want, joinNames(alloc, matches.items),
     });
     fail(exit_no_session, "no session matching '{s}' (run 'boo ls')", .{want});
+}
+
+/// Check that `name` is exactly the name of an existing session, as
+/// every command but attach requires. Exits with code 3 otherwise.
+fn requireSession(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
+    paths.validateName(name) catch
+        fail(exit_no_session, "no session named {s} (run 'boo ls')", .{name});
+    const sock = try paths.socketPath(alloc, dir, name);
+    defer alloc.free(sock);
+    std.fs.cwd().access(sock, .{}) catch
+        fail(exit_no_session, "no session named {s} (run 'boo ls')", .{name});
 }
 
 pub const SessionInfo = struct {
@@ -410,7 +419,7 @@ fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try socketDir(alloc);
     defer alloc.free(dir);
-    const name = try resolveSession(alloc, dir, want);
+    const name = try resolvePrefix(alloc, dir, want);
     defer alloc.free(name);
     try attachLoop(alloc, dir, name);
 }
@@ -575,13 +584,12 @@ fn cmdSend(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (stdin and (text != null or keys_arg != null)) {
         usageFail("send", "--stdin cannot be combined with --text or --key", .{});
     }
-    const want = name_arg orelse usageFail("send", "a session name is required", .{});
+    const name = name_arg orelse usageFail("send", "a session name is required", .{});
 
-    // Resolve the session before potentially blocking on stdin.
+    // Check the session before potentially blocking on stdin.
     const dir = try socketDir(alloc);
     defer alloc.free(dir);
-    const name = try resolveSession(alloc, dir, want);
-    defer alloc.free(name);
+    try requireSession(alloc, dir, name);
 
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(alloc);
@@ -710,12 +718,11 @@ fn cmdPeek(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             usageFail("peek", "unexpected argument '{s}'", .{arg});
         }
     }
-    const want = name_arg orelse usageFail("peek", "a session name is required", .{});
+    const name = name_arg orelse usageFail("peek", "a session name is required", .{});
 
     const dir = try socketDir(alloc);
     defer alloc.free(dir);
-    const name = try resolveSession(alloc, dir, want);
-    defer alloc.free(name);
+    try requireSession(alloc, dir, name);
 
     const result = try mustControl(alloc, dir, name, &.{
         "peek", if (scrollback) "scrollback" else "screen",
@@ -783,14 +790,13 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     if ((text != null) == idle) {
         usageFail("wait", "exactly one of --text or --idle is required", .{});
     }
-    const want = name_arg orelse usageFail("wait", "a session name is required", .{});
+    const name = name_arg orelse usageFail("wait", "a session name is required", .{});
     const timeout_ms = parseDurationMs(timeout_str) orelse
         usageFail("wait", "bad duration '{s}' (use 500ms, 2s, 1m, 4h, 1d)", .{timeout_str});
 
     const dir = try socketDir(alloc);
     defer alloc.free(dir);
-    const name = try resolveSession(alloc, dir, want);
-    defer alloc.free(name);
+    try requireSession(alloc, dir, name);
 
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (true) {
@@ -864,9 +870,8 @@ fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     }
 
-    const want = name_arg orelse usageFail("kill", "a session name or --all is required", .{});
-    const name = try resolveSession(alloc, dir, want);
-    defer alloc.free(name);
+    const name = name_arg orelse usageFail("kill", "a session name or --all is required", .{});
+    try requireSession(alloc, dir, name);
     const result = try mustControl(alloc, dir, name, &.{"quit"});
     defer alloc.free(result.text);
     if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
@@ -887,15 +892,14 @@ fn cmdRename(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             usageFail("rename", "unexpected argument '{s}'", .{arg});
         }
     }
-    const want = old_arg orelse usageFail("rename", "a session name is required", .{});
+    const name = old_arg orelse usageFail("rename", "a session name is required", .{});
     const new_name = new_arg orelse usageFail("rename", "a new session name is required", .{});
     paths.validateName(new_name) catch
         usageFail("rename", "invalid session name '{s}'", .{new_name});
 
     const dir = try socketDir(alloc);
     defer alloc.free(dir);
-    const name = try resolveSession(alloc, dir, want);
-    defer alloc.free(name);
+    try requireSession(alloc, dir, name);
 
     const result = try mustControl(alloc, dir, name, &.{ "rename", new_name });
     defer alloc.free(result.text);

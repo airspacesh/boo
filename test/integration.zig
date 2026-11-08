@@ -1585,11 +1585,27 @@ test "exit codes distinguish usage, missing sessions, and ambiguity" {
 
     try h.startDetached("alpha", &.{"cat"});
     try h.startDetached("alike", &.{"cat"});
+    try h.startDetached("zeta", &.{"cat"});
 
-    // Unique prefix resolves; ambiguous prefix and unknown names exit 3.
-    try h.runOk(&.{ "peek", "alp" });
-    try h.runExit(&.{ "peek", "al" }, 3);
+    // An ambiguous prefix names the sessions it matches, and only those.
+    const ambiguous = try h.run(&.{ "attach", "al" });
+    defer h.alloc.free(ambiguous.stdout);
+    defer h.alloc.free(ambiguous.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, ambiguous.stderr, "alike") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ambiguous.stderr, "zeta") == null);
+
+    // attach resolves a unique prefix and then wants a terminal. An
+    // ambiguous prefix and unknown names exit 3.
+    try h.runExit(&.{ "attach", "alp" }, 1);
+    try h.runExit(&.{ "attach", "al" }, 3);
     try h.runExit(&.{ "attach", "nosuchzz" }, 3);
+    // Every other command takes the exact name only.
+    try h.runOk(&.{ "peek", "alpha" });
+    try h.runExit(&.{ "peek", "alp" }, 3);
+    try h.runExit(&.{ "send", "alp", "--text", "x" }, 3);
+    try h.runExit(&.{ "wait", "alp", "--idle" }, 3);
+    try h.runExit(&.{ "rename", "alp", "beta" }, 3);
+    try h.runExit(&.{ "kill", "alp" }, 3);
     try h.runExit(&.{ "a", "nosuchzz" }, 3);
     try h.runExit(&.{ "kill", "nosuchzz" }, 3);
 

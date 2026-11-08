@@ -64,6 +64,9 @@ boo kill --all             # end every session
 
 With no name, `boo new` names the session after the current directory,
 falling back to the process id when that name is taken or unusable.
+`attach` accepts a unique prefix of a session's name (`boo at w`), and
+every other command takes the exact name, so a script cannot act on the
+wrong session.
 
 Run `boo help` for the full overview, `boo help <command>` for flags
 and examples, and `boo help --all` to print every help page at once.
