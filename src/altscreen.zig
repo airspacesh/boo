@@ -17,7 +17,7 @@ const std = @import("std");
 const vt = @import("ghostty-vt");
 
 const State = vt.Parser.State;
-const Transition = vt.parse_table.Transition;
+pub const Transition = vt.parse_table.Transition;
 
 /// Room for a held sequence. A screen switch takes under 20 bytes. A
 /// longer private-mode sequence is stripped and repainted, because it

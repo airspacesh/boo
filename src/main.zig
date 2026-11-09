@@ -1102,7 +1102,7 @@ test {
     _ = @import("reap.zig");
     _ = @import("altscreen.zig");
     _ = @import("oscquery.zig");
-    _ = @import("statusfilter.zig");
+    _ = @import("termfilter.zig");
     _ = @import("sessions.zig");
     _ = @import("menu.zig");
     _ = @import("window.zig");

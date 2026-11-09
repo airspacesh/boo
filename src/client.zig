@@ -10,7 +10,7 @@ const window = @import("window.zig");
 const keys = @import("keys.zig");
 const paths = @import("paths.zig");
 const Menu = @import("menu.zig").Menu;
-const statusfilter = @import("statusfilter.zig");
+const termfilter = @import("termfilter.zig");
 
 const log = std.log.scoped(.client);
 
@@ -141,7 +141,8 @@ pub fn attach(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !Endi
     defer restoreTty(
         tty,
         saved,
-        if (terminal.program_status) restore_sequence_with_status else restore_sequence,
+        if (terminal.supports.program_status) restore_sequence_with_status else restore_sequence,
+        terminal.supports.kitty_keyboard,
         eof_guard,
         'd',
     );
@@ -151,10 +152,10 @@ pub fn attach(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !Endi
     const tty_name = try ptypkg.ttyName(tty, &tty_name_buf);
     const tty_device = try ptypkg.ttyDevice(tty);
     var reason: protocol.AttachReason = .attach;
-    // Strips status reports for a terminal that does not take them. One
-    // filter serves the whole attachment, since the terminal sees one
-    // stream across switches.
-    var status_filter: ?statusfilter.Filter = null;
+    // Keeps sequences the terminal does not take off it. One filter
+    // serves the whole attachment, since the terminal sees one stream
+    // across switches.
+    var filter: termfilter.Filter = .{ .supports = .{} };
     while (true) {
         // Handshake with our current size first so the daemon sees the
         // attach promptly. The background probe below blocks briefly; a
@@ -172,21 +173,21 @@ pub fn attach(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !Endi
 
         // Probe the real terminal once. Its background color lets each
         // daemon answer OSC 11 theme queries from inside its session,
-        // where the application can no longer reach this terminal. A
-        // terminal that does not take program status reports gets them
-        // filtered out, since some print them as text. The probe yields
-        // to a pending signal, and any keystrokes typed during it are
+        // where the application can no longer reach this terminal. The
+        // protocols it does not take are filtered out of its output,
+        // since some terminals print them as text. The probe yields to a
+        // pending signal, and any keystrokes typed during it are
         // forwarded as input afterward.
         if (reason == .attach) {
             var probe_scratch: [256]u8 = undefined;
             var leftover_len: usize = 0;
             terminal = probeTerminal(tty, pipe_fds[0], &probe_scratch, &leftover_len);
             if (leftover_len > 0) protocol.writeMsg(sock, .input, probe_scratch[0..leftover_len]) catch {};
-            if (!terminal.program_status) status_filter = .{};
+            filter.supports = terminal.supports;
         }
         if (terminal.background) |color| protocol.writeMsg(sock, .bg_color, &color.encode()) catch {};
 
-        switch (try relay(alloc, dir, sock, pipe_fds[0], session, previous, &status_filter, &eof_guard)) {
+        switch (try relay(alloc, dir, sock, pipe_fds[0], session, previous, &filter, &eof_guard)) {
             .end => |outcome| return .{ .outcome = outcome, .session = session },
             .move => |move| {
                 posix.close(sock);
@@ -232,7 +233,7 @@ fn relay(
     signal_fd: posix.fd_t,
     session: []const u8,
     previous: ?[]const u8,
-    status_filter: *?statusfilter.Filter,
+    filter: *termfilter.Filter,
     eof_guard: *bool,
 ) !Step {
     const tty: posix.fd_t = 0;
@@ -325,11 +326,7 @@ fn relay(
                     // Output is a byte stream, so the leading pieces
                     // of a large output can be written as they arrive.
                     .part, .output => {
-                        if (status_filter.*) |*filter| {
-                            try filter.feed(msg.payload, &stdout.interface);
-                        } else {
-                            try stdout.interface.writeAll(msg.payload);
-                        }
+                        try filter.feed(msg.payload, &stdout.interface);
                         try stdout.interface.flush();
                     },
                     .detached => {
@@ -370,15 +367,14 @@ fn relay(
 pub const Terminal = struct {
     /// Its background color, when it reported one.
     background: ?protocol.RgbPayload = null,
-    /// It answered the program status support query (OSC 7501), so the
-    /// session's status reports pass through to it.
-    program_status: bool = false,
+    /// The protocols it answered the query of.
+    supports: termfilter.Supports = .{},
 };
 
-/// Ask the real terminal for its background color (OSC 11) and whether
-/// it takes program status reports (OSC 7501). A terminal answers in
-/// order, so once the background reply arrives, a status reply would
-/// have come before it. The probe gives up after `probe_timeout_ms`, or
+/// Ask the real terminal for its background color (OSC 11), and which
+/// of program status (OSC 7501), the kitty keyboard protocol and
+/// modifyOtherKeys it takes. A terminal answers in order, so once the
+/// background reply arrives, any other reply would have come before it. The probe gives up after `probe_timeout_ms`, or
 /// when a pending signal (resize or quit) on `signal_fd` needs the
 /// caller's loop. Bytes read while waiting that are not a reply (e.g. a
 /// keystroke typed during attach) are left in
@@ -393,7 +389,10 @@ pub fn probeTerminal(
     leftover_len.* = 0;
     // The queries go to the terminal on stdout; the replies arrive on the
     // input fd. For an attached client both are the same tty.
-    protocol.writeAll(posix.STDOUT_FILENO, "\x1b]7501;?\x1b\\\x1b]11;?\x07") catch return .{};
+    protocol.writeAll(posix.STDOUT_FILENO, "\x1b]7501;?\x1b\\" ++ // program status
+        "\x1b[?u" ++ // kitty keyboard flags
+        "\x1b[?4m" ++ // modifyOtherKeys (XTQMODKEYS)
+        "\x1b]11;?\x07") catch return .{};
 
     var terminal: Terminal = .{};
     const deadline = std.time.milliTimestamp() + probe_timeout_ms;
@@ -416,7 +415,15 @@ pub fn probeTerminal(
         len += n;
         // Drop each reply from the buffer, keeping anything else.
         if (findReply(scratch[0..len], "\x1b]7501;")) |span| {
-            terminal.program_status = true;
+            terminal.supports.program_status = true;
+            len = cutSpan(scratch[0..len], span);
+        }
+        if (findCsiReply(scratch[0..len], "\x1b[?", 'u')) |span| {
+            terminal.supports.kitty_keyboard = true;
+            len = cutSpan(scratch[0..len], span);
+        }
+        if (findCsiReply(scratch[0..len], "\x1b[>4", 'm')) |span| {
+            terminal.supports.modify_other_keys = true;
             len = cutSpan(scratch[0..len], span);
         }
         if (findReply(scratch[0..len], "\x1b]11;")) |span| {
@@ -436,6 +443,20 @@ fn cutSpan(data: []u8, span: ReplySpan) usize {
 }
 
 const ReplySpan = struct { start: usize, end: usize };
+
+/// Locate a complete CSI reply that starts with `prefix` and ends with
+/// `final`, with only digits and semicolons between, returning the byte
+/// span it occupies.
+fn findCsiReply(data: []const u8, prefix: []const u8, final: u8) ?ReplySpan {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, data, from, prefix)) |start| {
+        var end = start + prefix.len;
+        while (end < data.len and (std.ascii.isDigit(data[end]) or data[end] == ';')) end += 1;
+        if (end < data.len and data[end] == final) return .{ .start = start, .end = end + 1 };
+        from = start + 1;
+    }
+    return null;
+}
 
 /// Locate a complete reply that starts with `marker` (an OSC like
 /// `ESC ] 11 ;`, ended by BEL or ST) in `data`, returning the byte span
@@ -621,6 +642,7 @@ pub fn restoreTty(
     tty: posix.fd_t,
     saved: posix.termios,
     restore: []const u8,
+    kitty_keyboard: bool,
     eof_guard: bool,
     trigger_cp: u32,
 ) void {
@@ -633,12 +655,13 @@ pub fn restoreTty(
     protocol.writeAll(1, restore) catch {};
     // Re-enable kitty report-events so a still-held command key reports
     // its release, ending the drain the instant the user lets go rather
-    // than waiting out the timed guard. Terminals without the kitty
-    // protocol ignore this and the guard still applies.
-    protocol.writeAll(1, drain_kbd_enable) catch {};
+    // than waiting out the timed guard. A terminal without the kitty
+    // protocol is left alone, since some print the sequence, and the
+    // guard still applies.
+    if (kitty_keyboard) protocol.writeAll(1, drain_kbd_enable) catch {};
     drainInput(tty, if (eof_guard) drain_guard_eof_ms else drain_guard_short_ms, trigger_cp);
     // Clear keyboard reporting again before the shell regains the tty.
-    protocol.writeAll(1, drain_kbd_disable) catch {};
+    if (kitty_keyboard) protocol.writeAll(1, drain_kbd_disable) catch {};
     // Switch the mode back without TCSAFLUSH: on Darwin its output-drain
     // half blocks until the PTY master has consumed the writes above, so
     // a peer that briefly stopped reading (a detach test between reads, a
@@ -801,6 +824,15 @@ test "findReply: only a fully terminated reply is located" {
     const status = findReply("x\x1b]7501;?:states=idle\x1b\\y", "\x1b]7501;").?;
     try std.testing.expectEqual(@as(usize, 1), status.start);
     try std.testing.expectEqual(@as(usize, 23), status.end);
+}
+
+test "findCsiReply: kitty and modifyOtherKeys replies are located whole" {
+    const kitty = findCsiReply("x\x1b[?15uy", "\x1b[?", 'u').?;
+    try std.testing.expectEqual(@as(usize, 1), kitty.start);
+    try std.testing.expectEqual(@as(usize, 7), kitty.end);
+    try std.testing.expect(findCsiReply("\x1b[>4;2m", "\x1b[>4", 'm') != null);
+    try std.testing.expect(findCsiReply("\x1b[>4;2", "\x1b[>4", 'm') == null);
+    try std.testing.expect(findCsiReply("\x1b[?2004$y", "\x1b[?", 'u') == null);
 }
 
 test "control times out when the daemon never answers" {

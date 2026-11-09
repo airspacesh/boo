@@ -497,6 +497,13 @@ const PtyClient = struct {
         }
     }
 
+    /// Answer the client's attach probe the way a terminal that takes the
+    /// protocols `replies` names would, before the probe gives up.
+    fn answerProbe(self: *PtyClient, replies: []const u8) !void {
+        try self.waitFor("\x1b]11;?\x07");
+        try self.send(replies);
+    }
+
     /// Drop accumulated output so later waitFor calls only see new data.
     fn clearOutput(self: *PtyClient) void {
         self.output.clearRetainingCapacity();
@@ -1734,8 +1741,11 @@ test "modifyOtherKeys apps: encoded C-a still detaches" {
     var h = try Harness.init(alloc);
     defer h.deinit();
 
+    // A terminal that takes modifyOtherKeys, like xterm.
+    const modify_reply = "\x1b[>4;0m";
     var client = try PtyClient.spawn(&h, &.{ "new", "mok", "--", "bash", "--norc" }, 24, 80);
     defer client.deinit();
+    try client.answerProbe(modify_reply);
     try h.waitSessionUp("mok");
     try client.waitFor("\x1b[H\x1b[2J"); // attach repaint
 
@@ -1766,6 +1776,7 @@ test "modifyOtherKeys apps: encoded C-a still detaches" {
     // the fully encoded C-a C-d variant detaches as well.
     var second = try PtyClient.spawn(&h, &.{ "attach", "mok" }, 24, 80);
     defer second.deinit();
+    try second.answerProbe(modify_reply);
     try second.waitFor("MODIFY-APP");
     try second.waitFor("\x1b[>4;2m");
     try second.send("\x1b[27;5;97~\x1b[27;5;100~");
@@ -2712,8 +2723,7 @@ test "program status: a terminal that answers the status query gets the session'
     // would, before the probe gives up.
     var client = try PtyClient.spawn(&h, &.{ "attach", "on" }, 24, 80);
     defer client.deinit();
-    try client.waitFor("\x1b]7501;?\x1b\\");
-    try client.send("\x1b]7501;?:states=idle,working,done,blocked,error\x1b\\");
+    try client.answerProbe("\x1b]7501;?:states=idle,working,done,blocked,error\x1b\\");
 
     // The repaint gives the terminal the session's status, and later
     // reports pass through.
@@ -2810,4 +2820,36 @@ test "C-a m lists the sessions, Esc cancels, and Enter switches to the one picke
     try client.send("\x01d");
     try client.waitFor("detached from apple");
     try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
+}
+
+test "keyboard protocols a terminal does not answer for never reach it" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // An app that turns on the kitty keyboard protocol and
+    // modifyOtherKeys, as Claude Code does where the terminal takes them.
+    try h.startDetached("kb", &.{ "sh", "-c", "printf '\\033[>5u\\033[>4;2mKB-%s\\n' ON; sleep 30" });
+    alloc.free(try h.waitPeekContains("kb", "KB-ON"));
+
+    // The test terminal answers neither query, so neither the repaint
+    // that replays the modes nor the app's own sequences reach it.
+    var client = try PtyClient.spawn(&h, &.{ "attach", "kb" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("KB-ON");
+    try client.send("\x01l");
+    try client.waitFor("\x1b[H\x1b[2J");
+    try pumpQuiet(&client);
+    // The client's own probe asks with `?`, which is not a mode change.
+    for ([_][]const u8{ "\x1b[=", "\x1b[>5u", "\x1b[<u", "\x1b[>4;" }) |mode| {
+        try std.testing.expect(std.mem.indexOf(u8, client.output.items, mode) == null);
+    }
+
+    // A terminal that answers for the kitty protocol gets it.
+    var kitty = try PtyClient.spawn(&h, &.{ "attach", "kb" }, 24, 80);
+    defer kitty.deinit();
+    try kitty.answerProbe("\x1b[?0u");
+    try kitty.waitFor("\x1b[=5;1u");
+    try pumpQuiet(&kitty);
+    try std.testing.expect(std.mem.indexOf(u8, kitty.output.items, "\x1b[>4;") == null);
 }
