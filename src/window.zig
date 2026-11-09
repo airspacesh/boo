@@ -530,7 +530,8 @@ pub const Window = struct {
     /// Give the client terminal this window's program status (OSC 7501)
     /// in place of whatever it held, which may be another session's. A
     /// report replaces the root record whole, so the clear is needed only
-    /// when there is no status to send.
+    /// when there is no status to send. A client whose terminal does not
+    /// take status reports filters this out.
     fn writeProgramStatus(self: *Window, writer: *std.Io.Writer) !void {
         if (self.status.len == 0) return writer.writeAll(program_status_clear);
         try writer.print("\x1b]7501;{s}\x1b\\", .{self.status});

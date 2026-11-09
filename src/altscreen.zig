@@ -32,7 +32,7 @@ fn isAltScreenMode(param: u16) bool {
 /// The parser's transition on `byte` from `state`. In ground the
 /// window's stream decodes UTF-8 before the parser sees a byte, so only
 /// ESC starts a sequence there and C1 bytes are not controls.
-fn transition(state: State, byte: u8) Transition {
+pub fn transition(state: State, byte: u8) Transition {
     if (state == .ground) return .{
         .state = if (byte == 0x1b) .escape else .ground,
         .action = .none,

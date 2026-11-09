@@ -152,8 +152,9 @@ pub const commands = [_]Entry{
         \\
         \\Programs such as coding agents report their status with OSC
         \\7501, the Program Status Protocol: idle, working, done,
-        \\blocked, or error. pane keeps each session's latest report
-        \\and gives it to the terminal of the client attached to it.
+        \\blocked, or error. pane keeps each session's latest report,
+        \\and passes it on to the terminal you attach from when that
+        \\terminal says it takes status reports.
         \\
         \\flags:
         \\  --json  emit a JSON array:

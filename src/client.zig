@@ -10,16 +10,17 @@ const window = @import("window.zig");
 const keys = @import("keys.zig");
 const paths = @import("paths.zig");
 const Menu = @import("menu.zig").Menu;
+const statusfilter = @import("statusfilter.zig");
 
 const log = std.log.scoped(.client);
 
 /// The attached client renders inside the terminal's own alternate
 /// screen (like screen and tmux), so detaching restores the user's
 /// pre-attach shell view. `1049h` also saves the cursor, which the
-/// final `1049l` restores after undoing any state the session set,
-/// including the program status it reported.
+/// final `1049l` restores after undoing any state the session set.
 const enter_sequence = "\x1b[?1049h";
-const restore_sequence = window.reset_state_sequence ++ window.program_status_clear ++ "\x1b[?1049l";
+const restore_sequence = window.reset_state_sequence ++ "\x1b[?1049l";
+const restore_sequence_with_status = window.reset_state_sequence ++ window.program_status_clear ++ "\x1b[?1049l";
 
 pub const Outcome = enum {
     detached,
@@ -134,14 +135,26 @@ pub fn attach(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !Endi
     // Set by the outcome paths below when a held C-d may still be
     // repeating; read by the deferred restore.
     var eof_guard = false;
-    defer restoreTty(tty, saved, restore_sequence, eof_guard, 'd');
+    // What the terminal answers to the probe below. One that takes
+    // program status loses the session's on detach.
+    var terminal: Terminal = .{};
+    defer restoreTty(
+        tty,
+        saved,
+        if (terminal.program_status) restore_sequence_with_status else restore_sequence,
+        eof_guard,
+        'd',
+    );
     try protocol.writeAll(1, enter_sequence);
 
     var tty_name_buf: [256]u8 = undefined;
     const tty_name = try ptypkg.ttyName(tty, &tty_name_buf);
     const tty_device = try ptypkg.ttyDevice(tty);
     var reason: protocol.AttachReason = .attach;
-    var background: ?protocol.RgbPayload = null;
+    // Strips status reports for a terminal that does not take them. One
+    // filter serves the whole attachment, since the terminal sees one
+    // stream across switches.
+    var status_filter: ?statusfilter.Filter = null;
     while (true) {
         // Handshake with our current size first so the daemon sees the
         // attach promptly. The background probe below blocks briefly; a
@@ -157,20 +170,23 @@ pub fn attach(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !Endi
         defer alloc.free(request);
         try protocol.writeMsg(sock, .attach, request);
 
-        // Probe the real terminal's background color once, so each
-        // daemon can answer OSC 11 theme queries from inside its
-        // session, where the application can no longer reach this
-        // terminal. The probe yields to a pending signal, and any
-        // keystrokes typed during it are forwarded as input afterward.
+        // Probe the real terminal once. Its background color lets each
+        // daemon answer OSC 11 theme queries from inside its session,
+        // where the application can no longer reach this terminal. A
+        // terminal that does not take program status reports gets them
+        // filtered out, since some print them as text. The probe yields
+        // to a pending signal, and any keystrokes typed during it are
+        // forwarded as input afterward.
         if (reason == .attach) {
             var probe_scratch: [256]u8 = undefined;
             var leftover_len: usize = 0;
-            background = probeBackground(tty, pipe_fds[0], &probe_scratch, &leftover_len);
+            terminal = probeTerminal(tty, pipe_fds[0], &probe_scratch, &leftover_len);
             if (leftover_len > 0) protocol.writeMsg(sock, .input, probe_scratch[0..leftover_len]) catch {};
+            if (!terminal.program_status) status_filter = .{};
         }
-        if (background) |color| protocol.writeMsg(sock, .bg_color, &color.encode()) catch {};
+        if (terminal.background) |color| protocol.writeMsg(sock, .bg_color, &color.encode()) catch {};
 
-        switch (try relay(alloc, dir, sock, pipe_fds[0], session, previous, &eof_guard)) {
+        switch (try relay(alloc, dir, sock, pipe_fds[0], session, previous, &status_filter, &eof_guard)) {
             .end => |outcome| return .{ .outcome = outcome, .session = session },
             .move => |move| {
                 posix.close(sock);
@@ -216,11 +232,14 @@ fn relay(
     signal_fd: posix.fd_t,
     session: []const u8,
     previous: ?[]const u8,
+    status_filter: *?statusfilter.Filter,
     eof_guard: *bool,
 ) !Step {
     const tty: posix.fd_t = 0;
     var decoder: protocol.Decoder = .init(alloc);
     defer decoder.deinit();
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&stdout_buf);
     // The session menu, while it is open. It reads the terminal's keys,
     // and the daemon sends no output.
     var menu: ?Menu = null;
@@ -305,7 +324,14 @@ fn relay(
                 switch (msg.type) {
                     // Output is a byte stream, so the leading pieces
                     // of a large output can be written as they arrive.
-                    .part, .output => try protocol.writeAll(1, msg.payload),
+                    .part, .output => {
+                        if (status_filter.*) |*filter| {
+                            try filter.feed(msg.payload, &stdout.interface);
+                        } else {
+                            try stdout.interface.writeAll(msg.payload);
+                        }
+                        try stdout.interface.flush();
+                    },
                     .detached => {
                         if (std.mem.eql(u8, msg.payload, "stolen")) return .{ .end = .stolen };
                         if (std.mem.eql(u8, msg.payload, "nested")) return .{ .end = .nested };
@@ -340,25 +366,36 @@ fn relay(
     }
 }
 
-/// Probe the real terminal for its background color via an OSC 11 query
-/// and parse the reply. Returns null if the terminal does not answer
-/// within `probe_timeout_ms` or a pending signal (resize/quit) on
-/// `signal_fd` cuts the probe short so the caller can service it. Bytes
-/// read while waiting that are not the reply (e.g. a keystroke typed
-/// during attach) are left in `scratch[0..leftover_len.*]` for the
-/// caller to forward as input. Pass -1 for `signal_fd` to skip the
-/// signal check.
-pub fn probeBackground(
+/// What the client's terminal said when asked at attach.
+pub const Terminal = struct {
+    /// Its background color, when it reported one.
+    background: ?protocol.RgbPayload = null,
+    /// It answered the program status support query (OSC 7501), so the
+    /// session's status reports pass through to it.
+    program_status: bool = false,
+};
+
+/// Ask the real terminal for its background color (OSC 11) and whether
+/// it takes program status reports (OSC 7501). A terminal answers in
+/// order, so once the background reply arrives, a status reply would
+/// have come before it. The probe gives up after `probe_timeout_ms`, or
+/// when a pending signal (resize or quit) on `signal_fd` needs the
+/// caller's loop. Bytes read while waiting that are not a reply (e.g. a
+/// keystroke typed during attach) are left in
+/// `scratch[0..leftover_len.*]` for the caller to forward as input. Pass
+/// -1 for `signal_fd` to skip the signal check.
+pub fn probeTerminal(
     tty: posix.fd_t,
     signal_fd: posix.fd_t,
     scratch: []u8,
     leftover_len: *usize,
-) ?protocol.RgbPayload {
+) Terminal {
     leftover_len.* = 0;
-    // The query goes to the terminal on stdout; the reply arrives on the
+    // The queries go to the terminal on stdout; the replies arrive on the
     // input fd. For an attached client both are the same tty.
-    protocol.writeAll(posix.STDOUT_FILENO, "\x1b]11;?\x07") catch return null;
+    protocol.writeAll(posix.STDOUT_FILENO, "\x1b]7501;?\x1b\\\x1b]11;?\x07") catch return .{};
 
+    var terminal: Terminal = .{};
     const deadline = std.time.milliTimestamp() + probe_timeout_ms;
     var len: usize = 0;
     while (len < scratch.len) {
@@ -377,26 +414,33 @@ pub fn probeBackground(
         const n = posix.read(tty, scratch[len..]) catch break;
         if (n == 0) break;
         len += n;
-        if (findOsc11Reply(scratch[0..len])) |span| {
-            const color = parseOsc11Reply(scratch[span.start..span.end]);
-            // Drop the reply from the buffer; keep anything else (typed
-            // input) as leftover for the caller to forward.
-            const removed = span.end - span.start;
-            std.mem.copyForwards(u8, scratch[span.start..], scratch[span.end..len]);
-            leftover_len.* = len - removed;
-            return color;
+        // Drop each reply from the buffer, keeping anything else.
+        if (findReply(scratch[0..len], "\x1b]7501;")) |span| {
+            terminal.program_status = true;
+            len = cutSpan(scratch[0..len], span);
+        }
+        if (findReply(scratch[0..len], "\x1b]11;")) |span| {
+            terminal.background = parseOsc11Reply(scratch[span.start..span.end]);
+            len = cutSpan(scratch[0..len], span);
+            break;
         }
     }
     leftover_len.* = len;
-    return null;
+    return terminal;
 }
 
-const Osc11Span = struct { start: usize, end: usize };
+/// Remove `span` from `data`, returning the length left.
+fn cutSpan(data: []u8, span: ReplySpan) usize {
+    std.mem.copyForwards(u8, data[span.start..], data[span.end..]);
+    return data.len - (span.end - span.start);
+}
 
-/// Locate a complete OSC 11 reply (`ESC ] 11 ; ... BEL|ST`) in `data`,
-/// returning the byte span it occupies, terminator included.
-fn findOsc11Reply(data: []const u8) ?Osc11Span {
-    const marker = "\x1b]11;";
+const ReplySpan = struct { start: usize, end: usize };
+
+/// Locate a complete reply that starts with `marker` (an OSC like
+/// `ESC ] 11 ;`, ended by BEL or ST) in `data`, returning the byte span
+/// it occupies, terminator included.
+fn findReply(data: []const u8, marker: []const u8) ?ReplySpan {
     const start = std.mem.indexOf(u8, data, marker) orelse return null;
     const body = data[start + marker.len ..];
     if (std.mem.indexOfScalar(u8, body, 0x07)) |bel| {
@@ -746,13 +790,17 @@ test "parseOsc11Reply: BEL and ST terminators, various channel widths" {
     try std.testing.expect(parseOsc11Reply("\x1b]11;rgb:00/00\x07") == null); // too few channels
 }
 
-test "findOsc11Reply: only a fully terminated reply is located" {
+test "findReply: only a fully terminated reply is located" {
     // Incomplete (no terminator yet): not found.
-    try std.testing.expect(findOsc11Reply("\x1b]11;rgb:1111/2222/3333") == null);
+    try std.testing.expect(findReply("\x1b]11;rgb:1111/2222/3333", "\x1b]11;") == null);
     // BEL-terminated reply: span covers the terminator (exclusive end).
-    const span = findOsc11Reply("ab\x1b]11;rgb:1111/2222/3333\x07cd").?;
+    const span = findReply("ab\x1b]11;rgb:1111/2222/3333\x07cd", "\x1b]11;").?;
     try std.testing.expectEqual(@as(usize, 2), span.start);
     try std.testing.expectEqual(@as(usize, 26), span.end);
+    // An ST-terminated status reply, among other bytes.
+    const status = findReply("x\x1b]7501;?:states=idle\x1b\\y", "\x1b]7501;").?;
+    try std.testing.expectEqual(@as(usize, 1), status.start);
+    try std.testing.expectEqual(@as(usize, 23), status.end);
 }
 
 test "control times out when the daemon never answers" {

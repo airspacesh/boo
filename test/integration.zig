@@ -2632,14 +2632,15 @@ fn waitStatus(h: *Harness, session: []const u8, want: ?[]const u8) !void {
     }
 }
 
-test "program status: pane answers the query, lists the status, and gives it to the client terminal" {
+test "program status: pane answers the query and lists the status, and a terminal that does not take status never sees it" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
 
     // Once attached, ask for support, then report being blocked on a
-    // question ("Pick one" in base64). The test terminal never answers
-    // the query, so only the daemon can unblock the read.
+    // question ("Pick one" in base64), split across two writes. The test
+    // terminal never answers the query, so only the daemon can unblock
+    // the read.
     const go_path = try std.fmt.allocPrint(alloc, "{s}/go", .{h.dir});
     defer alloc.free(go_path);
     const script = try std.fmt.allocPrint(
@@ -2648,7 +2649,8 @@ test "program status: pane answers the query, lists the status, and gives it to 
             "printf '\\033]7501;?\\033\\\\'; " ++
             "IFS= read -rs -d '\\' reply; " ++
             "printf 'STATUS-%s\\n' ANSWERED; " ++
-            "printf '\\033]7501;state=blocked:kind=question:msg=UGljayBvbmU=\\033\\\\'; " ++
+            "printf '\\033]7501;state=blocked:kind=question'; sleep 0.2; " ++
+            "printf ':msg=UGljayBvbmU=\\033\\\\AFTER-%s\\n' REPORT; " ++
             "sleep 30",
         .{go_path},
     );
@@ -2661,12 +2663,10 @@ test "program status: pane answers the query, lists the status, and gives it to 
 
     try h.touch("go");
     try client.waitFor("STATUS-ANSWERED");
-    // The query is the daemon's to answer, so it never reaches the
-    // client terminal, which would answer it a second time.
-    try std.testing.expect(std.mem.indexOf(u8, client.output.items, "\x1b]7501;?") == null);
-    // The report itself passes through.
-    const report = "\x1b]7501;state=blocked:kind=question:msg=UGljayBvbmU=\x1b\\";
-    try client.waitFor(report);
+    try client.waitFor("AFTER-REPORT");
+    // The test terminal ignored the client's own status query, so it sees
+    // neither the session's query nor its report.
+    try std.testing.expect(std.mem.indexOf(u8, client.output.items, "\x1b]7501;state") == null);
 
     try waitStatus(&h, "st", "blocked");
     {
@@ -2688,17 +2688,45 @@ test "program status: pane answers the query, lists the status, and gives it to 
         try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "blocked") != null);
     }
 
-    // Detaching takes the status off the client terminal.
-    client.clearOutput();
+    // Neither does a reattach repaint carry it.
     try client.send("\x01d");
     try client.waitFor("detached from st");
-    try std.testing.expect(std.mem.indexOf(u8, client.output.items, "\x1b]7501;state=clear\x1b\\") != null);
     _ = try client.waitExit();
-
-    // Reattaching gives it back.
     var again = try PtyClient.spawn(&h, &.{ "attach", "st" }, 24, 80);
     defer again.deinit();
-    try again.waitFor(report);
+    try again.waitFor("AFTER-REPORT");
+    try pumpQuiet(&again);
+    try std.testing.expect(std.mem.indexOf(u8, again.output.items, "\x1b]7501;state") == null);
+}
+
+test "program status: a terminal that answers the status query gets the session's status" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("on", &.{"sh"});
+    try h.sendLine("on", "printf '\\033]7501;state=working:app=make\\007'");
+    try waitStatus(&h, "on", "working");
+
+    // Answer the client's status query as a terminal that takes status
+    // would, before the probe gives up.
+    var client = try PtyClient.spawn(&h, &.{ "attach", "on" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("\x1b]7501;?\x1b\\");
+    try client.send("\x1b]7501;?:states=idle,working,done,blocked,error\x1b\\");
+
+    // The repaint gives the terminal the session's status, and later
+    // reports pass through.
+    try client.waitFor("\x1b]7501;state=working:app=make\x1b\\");
+    try h.sendLine("on", "printf '\\033]7501;state=done:app=%s\\007' make");
+    try client.waitFor("\x1b]7501;state=done:app=make\x07");
+
+    // Detaching clears it.
+    client.clearOutput();
+    try client.send("\x01d");
+    try client.waitFor("detached from on");
+    try std.testing.expect(std.mem.indexOf(u8, client.output.items, "\x1b]7501;state=clear\x1b\\") != null);
+    _ = try client.waitExit();
 }
 
 test "program status: reports with an id, clear, and a full reset" {
